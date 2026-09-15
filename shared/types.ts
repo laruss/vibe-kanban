@@ -30,6 +30,22 @@ export type ProjectStatusAutomationResponse = { automation: ProjectStatusAutomat
 
 export type ListProjectStatusAutomationsResponse = { automations: Array<ProjectStatusAutomationResponse>, };
 
+export type IssueStatusObservation = { issue_id: string, project_status_id: string, issue_updated_at: string, simple_id: string, title: string, description: string | null, entered: boolean, preferred_workspace_id: string | null, };
+
+export type StatusEntryKind = "baseline" | "transition" | "manual";
+
+export type StageRunTrigger = "manual" | "on_enter";
+
+export type StageRunStatus = "pending" | "starting" | "running" | "completed" | "failed" | "killed" | "start_failed";
+
+export type ProjectStatusEntry = { id: string, remote_project_id: string, issue_id: string, project_status_id: string, issue_updated_at: string, simple_id: string, title: string, description: string | null, entry_kind: StatusEntryKind, preferred_workspace_id: string | null, exited_at: string | null, created_at: string, updated_at: string, };
+
+export type ProjectStatusStageRun = { id: string, status_entry_id: string, remote_project_id: string, issue_id: string, project_status_id: string, trigger: StageRunTrigger, status: StageRunStatus, executor_profile_id: ExecutorProfileId, instructions: string, session_mode: AutomationSessionMode, workspace_id: string | null, session_id: string | null, error_code: string | null, error_message: string | null, started_at: string | null, completed_at: string | null, created_at: string, updated_at: string, };
+
+export type ProjectStatusStageRunResponse = { stage_run: ProjectStatusStageRun, execution_process_ids: Array<string>, };
+
+export type IssueAutomationState = { current_status_id: string | null, active_entry: ProjectStatusEntry | null, stage_runs: Array<ProjectStatusStageRunResponse>, };
+
 export type UpdateRepo = { display_name?: string | null, setup_script?: string | null, cleanup_script?: string | null, archive_script?: string | null, copy_files?: string | null, parallel_setup_script?: boolean | null, dev_server_script?: string | null, default_target_branch?: string | null, default_working_dir?: string | null, };
 
 export type SearchResult = { path: string, is_file: boolean, match_type: SearchMatchType, 
@@ -285,6 +301,12 @@ export type RegisterRepoRequest = { path: string, display_name: string | null, }
 export type InitRepoRequest = { parent_path: string, folder_name: string, };
 
 export type ProjectStatusAutomationError = { "type": "validation_failed", validation: ProjectStatusAutomationValidation, } | { "type": "status_ownership_conflict", project_status_id: string, };
+
+export type ObserveIssueStatusesRequest = { observations: Array<IssueStatusObservation>, };
+
+export type ObserveIssueStatusesResponse = { status_entry_ids: Array<string>, stage_run_ids: Array<string>, };
+
+export type StartProjectStatusStageRequest = { workspace_id: string | null, };
 
 export type TagSearchParams = { search: string | null, };
 

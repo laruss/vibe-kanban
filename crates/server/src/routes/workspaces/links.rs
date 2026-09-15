@@ -41,6 +41,7 @@ pub async fn link_workspace(
             files_changed: stats.as_ref().map(|s| s.files_changed as i32),
             lines_added: stats.as_ref().map(|s| s.lines_added as i32),
             lines_removed: stats.as_ref().map(|s| s.lines_removed as i32),
+            sync_issue_status: None,
         })
         .await?;
 

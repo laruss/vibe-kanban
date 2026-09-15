@@ -17,6 +17,7 @@ use db::{
         execution_process_repo_state::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
+        project_status_stage_run::ProjectStatusStageRun,
         repo::Repo,
         session::{CreateSession, Session, SessionError},
         workspace::{Workspace, WorkspaceError},
@@ -236,6 +237,20 @@ pub trait ContainerService {
 
     /// Finalize workspace execution by sending notifications
     async fn finalize_task(&self, ctx: &ExecutionContext) {
+        if let Err(error) = ProjectStatusStageRun::finish_for_execution(
+            &self.db().pool,
+            ctx.execution_process.id,
+            &ctx.execution_process.status,
+        )
+        .await
+        {
+            tracing::error!(
+                execution_process_id = %ctx.execution_process.id,
+                %error,
+                "Failed to finalize project status stage run"
+            );
+        }
+
         // Skip notification if process was intentionally killed by user
         if matches!(ctx.execution_process.status, ExecutionProcessStatus::Killed) {
             return;
@@ -1050,6 +1065,17 @@ pub trait ContainerService {
         executor_config: ExecutorConfig,
         prompt: String,
     ) -> Result<ExecutionProcess, ContainerError> {
+        self.start_workspace_for_stage(workspace, executor_config, prompt, None)
+            .await
+    }
+
+    async fn start_workspace_for_stage(
+        &self,
+        workspace: &Workspace,
+        executor_config: ExecutorConfig,
+        prompt: String,
+        stage_run_id: Option<Uuid>,
+    ) -> Result<ExecutionProcess, ContainerError> {
         // Create container
         self.create(workspace).await?;
 
@@ -1108,21 +1134,23 @@ pub trait ContainerService {
                     tracing::warn!(?e, "Failed to start setup script in parallel mode");
                 }
             }
-            self.start_execution(
+            self.start_execution_for_stage(
                 &workspace,
                 &session,
                 &coding_action,
                 &ExecutionProcessRunReason::CodingAgent,
+                stage_run_id,
             )
             .await?
         } else {
             // Any sequential: chain ALL setups → coding agent via next_action
             let main_action = Self::build_sequential_setup_chain(&repos_with_setup, coding_action);
-            self.start_execution(
+            self.start_execution_for_stage(
                 &workspace,
                 &session,
                 &main_action,
                 &ExecutionProcessRunReason::SetupScript,
+                stage_run_id,
             )
             .await?
         };
@@ -1136,6 +1164,18 @@ pub trait ContainerService {
         session: &Session,
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
+    ) -> Result<ExecutionProcess, ContainerError> {
+        self.start_execution_for_stage(workspace, session, executor_action, run_reason, None)
+            .await
+    }
+
+    async fn start_execution_for_stage(
+        &self,
+        workspace: &Workspace,
+        session: &Session,
+        executor_action: &ExecutorAction,
+        run_reason: &ExecutionProcessRunReason,
+        stage_run_id: Option<Uuid>,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
@@ -1177,6 +1217,27 @@ pub trait ContainerService {
             &repo_states,
         )
         .await?;
+
+        if let Some(stage_run_id) = stage_run_id
+            && let Err(error) = ProjectStatusStageRun::attach_execution(
+                &self.db().pool,
+                stage_run_id,
+                execution_process.id,
+                session.id,
+                workspace.id,
+                run_reason,
+            )
+            .await
+        {
+            let _ = ExecutionProcess::update_completion(
+                &self.db().pool,
+                execution_process.id,
+                ExecutionProcessStatus::Failed,
+                None,
+            )
+            .await;
+            return Err(error.into());
+        }
         self.msg_stores()
             .write()
             .await
@@ -1383,8 +1444,20 @@ pub trait ContainerService {
             ) => ExecutionProcessRunReason::CodingAgent,
         };
 
-        self.start_execution(&ctx.workspace, &ctx.session, next_action, &next_run_reason)
-            .await?;
+        let stage_run_id = ProjectStatusStageRun::stage_run_id_for_execution(
+            &self.db().pool,
+            ctx.execution_process.id,
+        )
+        .await?;
+
+        self.start_execution_for_stage(
+            &ctx.workspace,
+            &ctx.session,
+            next_action,
+            &next_run_reason,
+            stage_run_id,
+        )
+        .await?;
 
         tracing::debug!("Started next action: {:?}", next_action);
         Ok(())

@@ -642,10 +642,11 @@ impl IssueRepository {
         pool: &PgPool,
         issue_id: Uuid,
         user_id: Uuid,
+        sync_issue_status: bool,
     ) -> Result<(), IssueError> {
         // Status sync: only on first workspace
         let workspace_count = WorkspaceRepository::count_by_issue_id(pool, issue_id).await?;
-        if workspace_count == 1 {
+        if sync_issue_status && workspace_count == 1 {
             let Some(issue) = Self::find_by_id(pool, issue_id).await? else {
                 return Ok(());
             };

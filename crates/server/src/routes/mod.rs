@@ -21,6 +21,7 @@ pub mod oauth;
 pub mod organizations;
 pub mod preview;
 pub mod project_status_automations;
+pub mod project_status_stage_runs;
 pub mod relay_auth;
 pub mod releases;
 pub mod remote;
@@ -52,6 +53,7 @@ pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
         .merge(search::router(&deployment))
         .merge(preview::api_router())
         .merge(project_status_automations::router())
+        .merge(project_status_stage_runs::router())
         .merge(releases::router())
         .merge(sessions::router(&deployment))
         .merge(terminal::router())

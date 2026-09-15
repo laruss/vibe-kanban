@@ -8,6 +8,16 @@ export type Repo = { id: string, path: string, name: string, display_name: strin
 
 export type Project = { id: string, name: string, default_agent_working_dir: string | null, remote_project_id: string | null, created_at: Date, updated_at: Date, };
 
+export type ProjectWorkflowConfig = { remote_project_id: string, enabled: boolean, implementation_profile_id: ExecutorProfileId, review_profile_id: ExecutorProfileId, implementation_instructions: string, review_instructions: string, auto_advance: boolean, allow_human_override: boolean, };
+
+export type UpdateProjectWorkflowConfig = { enabled: boolean, implementation_profile_id: ExecutorProfileId, review_profile_id: ExecutorProfileId, implementation_instructions: string, review_instructions: string, auto_advance: boolean, allow_human_override: boolean, };
+
+export type ProjectWorkflowConfigResponse = { config: ProjectWorkflowConfig, problems: Array<WorkflowConfigProblem>, };
+
+export type WorkflowConfigProblem = { "type": "missing_profile", role: WorkflowRole, profile_id: ExecutorProfileId, } | { "type": "executor_role_mismatch", role: WorkflowRole, profile_id: ExecutorProfileId, expected_executor: BaseCodingAgent, actual_executor: BaseCodingAgent, } | { "type": "instructions_too_long", role: WorkflowRole, max_bytes: number, actual_bytes: number, };
+
+export type WorkflowRole = "implementation" | "review";
+
 export type UpdateRepo = { display_name?: string | null, setup_script?: string | null, cleanup_script?: string | null, archive_script?: string | null, copy_files?: string | null, parallel_setup_script?: boolean | null, dev_server_script?: string | null, default_target_branch?: string | null, default_working_dir?: string | null, };
 
 export type SearchResult = { path: string, is_file: boolean, match_type: SearchMatchType, 
@@ -261,6 +271,8 @@ export type UpdateMemberRoleResponse = { user_id: string, role: MemberRole, };
 export type RegisterRepoRequest = { path: string, display_name: string | null, };
 
 export type InitRepoRequest = { parent_path: string, folder_name: string, };
+
+export type WorkflowConfigError = { "type": "validation_failed", problems: Array<WorkflowConfigProblem>, };
 
 export type TagSearchParams = { search: string | null, };
 

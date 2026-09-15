@@ -171,7 +171,7 @@ fn parse_attachment_markdown_at(
     })
 }
 
-fn rewrite_imported_issue_attachments_markdown(
+pub(crate) fn rewrite_imported_issue_attachments_markdown(
     prompt: &str,
     imported_attachments: &[ImportedIssueAttachment],
 ) -> String {

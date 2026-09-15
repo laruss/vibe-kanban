@@ -104,6 +104,11 @@ import {
   ProjectStatusAutomationError,
   ProjectStatusAutomationResponse,
   UpdateProjectStatusAutomation,
+  IssueAutomationState,
+  ObserveIssueStatusesRequest,
+  ObserveIssueStatusesResponse,
+  ProjectStatusStageRunResponse,
+  StartProjectStatusStageRequest,
 } from 'shared/types';
 import type { Project as RemoteProject } from 'shared/remote-types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -1539,6 +1544,47 @@ export const projectStatusAutomationsApi = {
       { method: 'DELETE' }
     );
     return handleApiResponse<void>(response);
+  },
+};
+
+export const projectStatusStageRunsApi = {
+  observeStatuses: async (
+    remoteProjectId: string,
+    request: ObserveIssueStatusesRequest
+  ): Promise<ObserveIssueStatusesResponse> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/automation/status-observations`,
+      {
+        method: 'POST',
+        body: JSON.stringify(request),
+      }
+    );
+    return handleApiResponse<ObserveIssueStatusesResponse>(response);
+  },
+
+  getIssueState: async (
+    remoteProjectId: string,
+    issueId: string
+  ): Promise<IssueAutomationState> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/issues/${issueId}/automation`
+    );
+    return handleApiResponse<IssueAutomationState>(response);
+  },
+
+  start: async (
+    remoteProjectId: string,
+    issueId: string,
+    request: StartProjectStatusStageRequest
+  ): Promise<ProjectStatusStageRunResponse> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/issues/${issueId}/automation/start`,
+      {
+        method: 'POST',
+        body: JSON.stringify(request),
+      }
+    );
+    return handleApiResponse<ProjectStatusStageRunResponse>(response);
   },
 };
 

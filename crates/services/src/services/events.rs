@@ -3,7 +3,10 @@ use std::{str::FromStr, sync::Arc};
 use db::{
     DBService,
     models::{
-        execution_process::ExecutionProcess, scratch::Scratch, session::Session,
+        execution_process::ExecutionProcess,
+        project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
+        scratch::Scratch,
+        session::Session,
         workspace::Workspace,
     },
 };
@@ -20,7 +23,10 @@ mod streams;
 #[path = "events/types.rs"]
 pub mod types;
 
-pub use patches::{execution_process_patch, scratch_patch, workspace_patch};
+pub use patches::{
+    execution_process_patch, project_status_entry_patch, project_status_stage_run_patch,
+    scratch_patch, workspace_patch,
+};
 pub use types::{EventError, EventPatch, EventPatchInner, HookTables, RecordTypes};
 
 #[derive(Clone)]
@@ -177,6 +183,35 @@ impl EventService {
                                         }
                                     }
                                 }
+                                (HookTables::ProjectStatusEntries, _) => {
+                                    match ProjectStatusEntry::find_by_rowid(&db.pool, rowid).await {
+                                        Ok(Some(entry)) => RecordTypes::ProjectStatusEntry(entry),
+                                        Ok(None) => return,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to fetch project status entry: {:?}",
+                                                e
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                                (HookTables::ProjectStatusStageRuns, _) => {
+                                    match ProjectStatusStageRun::find_by_rowid(&db.pool, rowid).await
+                                    {
+                                        Ok(Some(stage_run)) => {
+                                            RecordTypes::ProjectStatusStageRun(stage_run)
+                                        }
+                                        Ok(None) => return,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to fetch project status stage run: {:?}",
+                                                e
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
                             };
 
                             let db_op: &str = match hook.operation {
@@ -250,6 +285,26 @@ impl EventService {
                                         );
                                     }
 
+                                    return;
+                                }
+                                RecordTypes::ProjectStatusEntry(entry) => {
+                                    let patch = match hook.operation {
+                                        SqliteOperation::Insert => {
+                                            project_status_entry_patch::add(entry)
+                                        }
+                                        _ => project_status_entry_patch::replace(entry),
+                                    };
+                                    msg_store_for_hook.push_patch(patch);
+                                    return;
+                                }
+                                RecordTypes::ProjectStatusStageRun(stage_run) => {
+                                    let patch = match hook.operation {
+                                        SqliteOperation::Insert => {
+                                            project_status_stage_run_patch::add(stage_run)
+                                        }
+                                        _ => project_status_stage_run_patch::replace(stage_run),
+                                    };
+                                    msg_store_for_hook.push_patch(patch);
                                     return;
                                 }
                                 RecordTypes::DeletedExecutionProcess {

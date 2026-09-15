@@ -387,7 +387,7 @@ impl AutomationStartMode {
 }
 
 impl AutomationSessionMode {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Fresh => "fresh",
             Self::ContinueIfCompatible => "continue_if_compatible",

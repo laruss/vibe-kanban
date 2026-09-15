@@ -17,6 +17,7 @@ use db::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
         execution_process_repo_state::ExecutionProcessRepoState,
+        project_status_stage_run::ProjectStatusStageRun,
         repo::Repo,
         scratch::{DraftFollowUpData, Scratch, ScratchType},
         session::{Session, SessionError},
@@ -596,6 +597,20 @@ impl LocalContainerService {
                         // If the process exited successfully, start the next action
                         if let Err(e) = container.try_start_next_action(&ctx).await {
                             tracing::error!("Failed to start next action after completion: {}", e);
+                            if let Err(stage_error) =
+                                ProjectStatusStageRun::mark_chained_start_failed_for_execution(
+                                    &db.pool,
+                                    ctx.execution_process.id,
+                                    &e.to_string(),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    execution_process_id = %ctx.execution_process.id,
+                                    %stage_error,
+                                    "Failed to record chained stage start failure"
+                                );
+                            }
                         }
                     } else {
                         tracing::info!(
@@ -1107,12 +1122,18 @@ impl LocalContainerService {
         };
 
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
+        let stage_run_id = ProjectStatusStageRun::stage_run_id_for_execution(
+            &self.db.pool,
+            ctx.execution_process.id,
+        )
+        .await?;
 
-        self.start_execution(
+        self.start_execution_for_stage(
             &ctx.workspace,
             &ctx.session,
             &action,
             &ExecutionProcessRunReason::CodingAgent,
+            stage_run_id,
         )
         .await
     }

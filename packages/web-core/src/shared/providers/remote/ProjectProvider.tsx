@@ -1,4 +1,4 @@
-import { useMemo, useCallback, type ReactNode } from 'react';
+import { useMemo, useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { useShape } from '@/shared/integrations/electric/hooks';
 import {
   PROJECT_ISSUES_SHAPE,
@@ -27,6 +27,7 @@ import {
   ProjectContext,
   type ProjectContextValue,
 } from '@/shared/hooks/useProjectContext';
+import { projectStatusStageRunsApi } from '@/shared/lib/api';
 
 interface ProjectProviderProps {
   projectId: string;
@@ -78,6 +79,130 @@ export function ProjectProvider({ projectId, children }: ProjectProviderProps) {
   const workspacesResult = useShape(PROJECT_WORKSPACES_SHAPE, params, {
     enabled,
   });
+
+  const lastStatusObservationFingerprintRef = useRef('');
+  const observedIssuesRef = useRef<{
+    projectId: string;
+    knownIssueIds: Set<string>;
+    pendingEnteredIssueIds: Set<string>;
+  } | null>(null);
+  useEffect(() => {
+    if (issuesResult.isLoading || workspacesResult.isLoading) return;
+
+    const currentIssueIds = new Set(
+      issuesResult.data.map((issue) => issue.id).filter(Boolean)
+    );
+    if (observedIssuesRef.current?.projectId !== projectId) {
+      // Treat the first complete project snapshot as a baseline. This avoids
+      // starting every existing on-enter stage after an upgrade or remount.
+      observedIssuesRef.current = {
+        projectId,
+        knownIssueIds: currentIssueIds,
+        pendingEnteredIssueIds: new Set(),
+      };
+    } else {
+      for (const issueId of currentIssueIds) {
+        if (!observedIssuesRef.current.knownIssueIds.has(issueId)) {
+          observedIssuesRef.current.pendingEnteredIssueIds.add(issueId);
+        }
+      }
+    }
+    const observedIssues = observedIssuesRef.current;
+
+    const preferredWorkspaceByIssue = new Map<string, string>();
+    const orderedWorkspaces = [...workspacesResult.data].sort((left, right) =>
+      right.updated_at.localeCompare(left.updated_at)
+    );
+    for (const workspace of orderedWorkspaces) {
+      if (
+        workspace.issue_id &&
+        workspace.local_workspace_id &&
+        !workspace.archived &&
+        !preferredWorkspaceByIssue.has(workspace.issue_id)
+      ) {
+        preferredWorkspaceByIssue.set(
+          workspace.issue_id,
+          workspace.local_workspace_id
+        );
+      }
+    }
+
+    const observations = issuesResult.data
+      .filter(
+        (issue) =>
+          Boolean(issue.id) &&
+          Boolean(issue.status_id) &&
+          Boolean(issue.updated_at) &&
+          Boolean(issue.simple_id) &&
+          Boolean(issue.title)
+      )
+      .map((issue) => ({
+        issue_id: issue.id,
+        project_status_id: issue.status_id,
+        issue_updated_at: issue.updated_at,
+        simple_id: issue.simple_id,
+        title: issue.title,
+        description: issue.description,
+        entered: observedIssues.pendingEnteredIssueIds.has(issue.id),
+        preferred_workspace_id: preferredWorkspaceByIssue.get(issue.id) ?? null,
+      }))
+      .sort((left, right) => left.issue_id.localeCompare(right.issue_id));
+
+    const fingerprint = observations
+      .map(
+        (observation) =>
+          `${observation.issue_id}:${observation.project_status_id}:${observation.issue_updated_at}:${observation.entered}:${observation.preferred_workspace_id ?? ''}`
+      )
+      .join('|');
+    if (fingerprint === lastStatusObservationFingerprintRef.current) return;
+    lastStatusObservationFingerprintRef.current = fingerprint;
+
+    const observeStatuses = (retryCount: number) => {
+      projectStatusStageRunsApi
+        .observeStatuses(projectId, { observations })
+        .then(() => {
+          if (lastStatusObservationFingerprintRef.current !== fingerprint) {
+            return;
+          }
+          for (const observation of observations) {
+            observedIssues.knownIssueIds.add(observation.issue_id);
+            observedIssues.pendingEnteredIssueIds.delete(observation.issue_id);
+          }
+        })
+        .catch((error) => {
+          if (lastStatusObservationFingerprintRef.current !== fingerprint) {
+            return;
+          }
+          if (retryCount < 3) {
+            window.setTimeout(
+              () => {
+                if (
+                  lastStatusObservationFingerprintRef.current === fingerprint
+                ) {
+                  observeStatuses(retryCount + 1);
+                }
+              },
+              1_000 * 2 ** retryCount
+            );
+            return;
+          }
+
+          lastStatusObservationFingerprintRef.current = '';
+          console.warn(
+            '[ProjectProvider] Failed to observe issue statuses:',
+            error
+          );
+        });
+    };
+
+    observeStatuses(0);
+  }, [
+    projectId,
+    issuesResult.data,
+    issuesResult.isLoading,
+    workspacesResult.data,
+    workspacesResult.isLoading,
+  ]);
 
   // Board readiness depends on core kanban data only.
   // Other project-scoped shapes hydrate opportunistically after render.

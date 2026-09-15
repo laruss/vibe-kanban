@@ -6,6 +6,7 @@ pub mod file;
 pub mod merge;
 pub mod project;
 pub mod project_status_automation;
+pub mod project_status_stage_run;
 pub mod pull_request;
 pub mod repo;
 pub mod requests;

@@ -21,6 +21,8 @@ pub struct CreateWorkspaceRequest {
     pub lines_added: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines_removed: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_issue_status: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

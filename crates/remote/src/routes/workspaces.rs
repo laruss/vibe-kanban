@@ -32,6 +32,7 @@ struct CreateWorkspaceRequest {
     pub files_changed: Option<i32>,
     pub lines_added: Option<i32>,
     pub lines_removed: Option<i32>,
+    pub sync_issue_status: Option<bool>,
 }
 
 pub(super) fn router() -> Router<AppState> {
@@ -90,9 +91,13 @@ async fn create_workspace(
     })?;
 
     if let Some(issue_id) = payload.issue_id {
-        if let Err(error) =
-            IssueRepository::sync_issue_from_workspace_created(state.pool(), issue_id, ctx.user.id)
-                .await
+        if let Err(error) = IssueRepository::sync_issue_from_workspace_created(
+            state.pool(),
+            issue_id,
+            ctx.user.id,
+            payload.sync_issue_status.unwrap_or(true),
+        )
+        .await
         {
             tracing::warn!(?error, "failed to sync issue from workspace creation");
         }

@@ -1,5 +1,8 @@
 use db::models::{
-    execution_process::ExecutionProcess, scratch::Scratch, workspace::WorkspaceWithStatus,
+    execution_process::ExecutionProcess,
+    project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
+    scratch::Scratch,
+    workspace::WorkspaceWithStatus,
 };
 use json_patch::{AddOperation, Patch, PatchOperation, RemoveOperation, ReplaceOperation};
 use uuid::Uuid;
@@ -7,6 +10,68 @@ use uuid::Uuid;
 // Shared helper to escape JSON Pointer segments
 fn escape_pointer_segment(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
+}
+
+pub mod project_status_entry_patch {
+    use super::*;
+
+    fn entry_path(entry_id: Uuid) -> String {
+        format!(
+            "/project_status_entries/{}",
+            escape_pointer_segment(&entry_id.to_string())
+        )
+    }
+
+    pub fn add(entry: &ProjectStatusEntry) -> Patch {
+        Patch(vec![PatchOperation::Add(AddOperation {
+            path: entry_path(entry.id)
+                .try_into()
+                .expect("Project status entry path should be valid"),
+            value: serde_json::to_value(entry)
+                .expect("Project status entry serialization should not fail"),
+        })])
+    }
+
+    pub fn replace(entry: &ProjectStatusEntry) -> Patch {
+        Patch(vec![PatchOperation::Replace(ReplaceOperation {
+            path: entry_path(entry.id)
+                .try_into()
+                .expect("Project status entry path should be valid"),
+            value: serde_json::to_value(entry)
+                .expect("Project status entry serialization should not fail"),
+        })])
+    }
+}
+
+pub mod project_status_stage_run_patch {
+    use super::*;
+
+    fn stage_run_path(stage_run_id: Uuid) -> String {
+        format!(
+            "/project_status_stage_runs/{}",
+            escape_pointer_segment(&stage_run_id.to_string())
+        )
+    }
+
+    pub fn add(stage_run: &ProjectStatusStageRun) -> Patch {
+        Patch(vec![PatchOperation::Add(AddOperation {
+            path: stage_run_path(stage_run.id)
+                .try_into()
+                .expect("Project status stage run path should be valid"),
+            value: serde_json::to_value(stage_run)
+                .expect("Project status stage run serialization should not fail"),
+        })])
+    }
+
+    pub fn replace(stage_run: &ProjectStatusStageRun) -> Patch {
+        Patch(vec![PatchOperation::Replace(ReplaceOperation {
+            path: stage_run_path(stage_run.id)
+                .try_into()
+                .expect("Project status stage run path should be valid"),
+            value: serde_json::to_value(stage_run)
+                .expect("Project status stage run serialization should not fail"),
+        })])
+    }
 }
 
 /// Helper functions for creating execution process-specific patches

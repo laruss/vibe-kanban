@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
-use api_types::{CreateWorkspaceRequest, Issue};
+use api_types::{CreateWorkspaceRequest, Issue, UpdateIssueRequest};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -10,7 +10,10 @@ use axum::{
 use db::models::{
     coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
-    project_status_automation::{AutomationSessionMode, ProjectStatusAutomation},
+    project_status_automation::{
+        AutomationCompletionMode, AutomationSessionMode, AutomationStartMode,
+        ProjectStatusAutomation,
+    },
     project_status_stage_result::{
         ProjectStatusStageAttempt, ProjectStatusStageAttemptResponse, ProjectStatusStageResult,
         ProjectStatusStageResultResponse, StageResultOutcome, StageResultRepositoryInput,
@@ -18,6 +21,10 @@ use db::models::{
     project_status_stage_run::{
         IssueAutomationState, IssueStatusObservation, ProjectStatusEntry, ProjectStatusStageRun,
         ProjectStatusStageRunResponse, StageRunError, StageRunTrigger,
+    },
+    project_status_workflow::{
+        ContinuationClaimOutcome, NewStageContinuation, ProjectStatusStageContinuation,
+        ProjectStatusWorkflowRun, StageContinuationStatus, WorkflowRunError, WorkflowRunStatus,
     },
     requests::WorkspaceRepoInput,
     scratch::{Scratch, ScratchPayload, ScratchType},
@@ -69,6 +76,11 @@ pub struct StartProjectStatusStageRequest {
     pub input_result_id: Option<Uuid>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct ResumeProjectStatusAutomationRequest {
+    pub transition_budget: Option<i32>,
+}
+
 #[derive(Debug)]
 struct StageStartFailure {
     code: &'static str,
@@ -98,6 +110,473 @@ pub fn router() -> Router<DeploymentImpl> {
             "/projects/{remote_project_id}/issues/{issue_id}/automation/start",
             post(start_issue_stage),
         )
+        .route(
+            "/projects/{remote_project_id}/issues/{issue_id}/automation/retry",
+            post(start_issue_stage),
+        )
+        .route(
+            "/projects/{remote_project_id}/issues/{issue_id}/automation/pause",
+            post(pause_issue_automation),
+        )
+        .route(
+            "/projects/{remote_project_id}/issues/{issue_id}/automation/resume",
+            post(resume_issue_automation),
+        )
+}
+
+pub(crate) fn spawn_workflow_worker(deployment: DeploymentImpl) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            if let Err(error) = process_workflow_continuations_once(&deployment).await {
+                tracing::error!(%error, "Failed to process project status workflow continuations");
+            }
+        }
+    });
+}
+
+async fn process_workflow_continuations_once(deployment: &DeploymentImpl) -> Result<(), ApiError> {
+    ProjectStatusStageContinuation::requeue_stale_claims(&deployment.db().pool).await?;
+
+    for result in ProjectStatusStageResult::list_without_continuation(&deployment.db().pool).await?
+    {
+        prepare_stage_continuation(deployment, &result).await?;
+    }
+
+    for continuation in ProjectStatusStageContinuation::list_pending(&deployment.db().pool).await? {
+        if ProjectStatusStageContinuation::claim(&deployment.db().pool, continuation.id).await?
+            == ContinuationClaimOutcome::Claimed
+        {
+            apply_stage_continuation(deployment, continuation.id).await?;
+        }
+    }
+
+    for stage_run in
+        ProjectStatusStageRun::list_pending_on_enter_for_active_workflows(&deployment.db().pool)
+            .await?
+    {
+        let input_result_id = match stage_run.workflow_run_id {
+            Some(workflow_run_id) => {
+                ProjectStatusStageContinuation::latest_advanced_result_for_target(
+                    &deployment.db().pool,
+                    workflow_run_id,
+                    stage_run.project_status_id,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let workspace_id = match input_result_id {
+            Some(result_id) => {
+                ProjectStatusStageResult::find_by_id(&deployment.db().pool, result_id)
+                    .await?
+                    .and_then(|result| result.workspace_id)
+            }
+            None => stage_run.workspace_id,
+        };
+        start_stage_run(deployment, stage_run.id, workspace_id, input_result_id).await?;
+    }
+
+    Ok(())
+}
+
+async fn prepare_stage_continuation(
+    deployment: &DeploymentImpl,
+    result: &ProjectStatusStageResult,
+) -> Result<(), ApiError> {
+    let Some(stage_run) =
+        ProjectStatusStageRun::find_by_id(&deployment.db().pool, result.stage_run_id).await?
+    else {
+        return Ok(());
+    };
+    let Some(workflow_run_id) = stage_run.workflow_run_id else {
+        return Ok(());
+    };
+    let workflow =
+        ProjectStatusWorkflowRun::find_by_id(&deployment.db().pool, workflow_run_id).await?;
+    let substantive_output = result.has_substantive_output(&deployment.db().pool).await?;
+    let (status, target_status_id, error_code, error_message) = continuation_decision(
+        result.outcome,
+        substantive_output,
+        stage_run.completion_mode,
+        stage_run.next_status_id,
+        workflow.as_ref().map(|workflow| workflow.status),
+    );
+
+    ProjectStatusStageContinuation::create(
+        &deployment.db().pool,
+        &NewStageContinuation {
+            result_id: result.id,
+            workflow_run_id,
+            source_stage_run_id: stage_run.id,
+            source_status_id: stage_run.project_status_id,
+            target_status_id,
+            status,
+            error_code: error_code.clone(),
+            error_message: error_message.clone(),
+        },
+    )
+    .await?;
+
+    match status {
+        StageContinuationStatus::Stayed => {
+            ProjectStatusWorkflowRun::set_status(
+                &deployment.db().pool,
+                workflow_run_id,
+                WorkflowRunStatus::Completed,
+                None,
+                None,
+            )
+            .await?;
+        }
+        StageContinuationStatus::Ineligible
+            if workflow
+                .as_ref()
+                .is_some_and(|workflow| workflow.status != WorkflowRunStatus::Paused) =>
+        {
+            ProjectStatusWorkflowRun::set_status(
+                &deployment.db().pool,
+                workflow_run_id,
+                WorkflowRunStatus::AwaitingManual,
+                error_code.as_deref(),
+                error_message.as_deref(),
+            )
+            .await?;
+        }
+        StageContinuationStatus::Paused => {
+            ProjectStatusWorkflowRun::set_status(
+                &deployment.db().pool,
+                workflow_run_id,
+                WorkflowRunStatus::Paused,
+                error_code.as_deref(),
+                error_message.as_deref(),
+            )
+            .await?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+type ContinuationDecision = (
+    StageContinuationStatus,
+    Option<Uuid>,
+    Option<String>,
+    Option<String>,
+);
+
+fn continuation_decision(
+    outcome: StageResultOutcome,
+    substantive_output: bool,
+    completion_mode: AutomationCompletionMode,
+    target_status_id: Option<Uuid>,
+    workflow_status: Option<WorkflowRunStatus>,
+) -> ContinuationDecision {
+    if workflow_status.is_some_and(|status| {
+        matches!(
+            status,
+            WorkflowRunStatus::Completed | WorkflowRunStatus::Superseded
+        )
+    }) {
+        return (
+            StageContinuationStatus::Superseded,
+            None,
+            Some("workflow_not_active".to_string()),
+            Some("The workflow had already ended before this stage finished".to_string()),
+        );
+    }
+    if outcome != StageResultOutcome::Completed {
+        return (
+            StageContinuationStatus::Ineligible,
+            None,
+            Some("stage_not_successful".to_string()),
+            Some(format!(
+                "Stage result is {outcome:?}; automatic advance requires a successful result"
+            )),
+        );
+    }
+    if !substantive_output {
+        return (
+            StageContinuationStatus::Ineligible,
+            None,
+            Some("empty_result".to_string()),
+            Some("The stage completed without a summary or repository changes".to_string()),
+        );
+    }
+
+    match completion_mode {
+        AutomationCompletionMode::Stay => (StageContinuationStatus::Stayed, None, None, None),
+        AutomationCompletionMode::AdvanceOnSuccess => match target_status_id {
+            Some(target_status_id) => (
+                StageContinuationStatus::Pending,
+                Some(target_status_id),
+                None,
+                None,
+            ),
+            None => (
+                StageContinuationStatus::Paused,
+                None,
+                Some("target_status_missing".to_string()),
+                Some("The stage has no target status snapshot".to_string()),
+            ),
+        },
+    }
+}
+
+async fn apply_stage_continuation(
+    deployment: &DeploymentImpl,
+    continuation_id: Uuid,
+) -> Result<(), ApiError> {
+    let Some(continuation) =
+        ProjectStatusStageContinuation::find_by_id(&deployment.db().pool, continuation_id).await?
+    else {
+        return Ok(());
+    };
+    let Some(target_status_id) = continuation.target_status_id else {
+        ProjectStatusStageContinuation::pause_with_error(
+            &deployment.db().pool,
+            continuation.id,
+            continuation.workflow_run_id,
+            "target_status_missing",
+            "The configured target status is missing",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let client = match deployment.remote_client() {
+        Ok(client) => client,
+        Err(error) => {
+            ProjectStatusStageContinuation::pause_with_error(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                "remote_unavailable",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let statuses = match client
+        .list_project_statuses(
+            ProjectStatusWorkflowRun::find_by_id(
+                &deployment.db().pool,
+                continuation.workflow_run_id,
+            )
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Workflow run not found".to_string()))?
+            .remote_project_id,
+        )
+        .await
+    {
+        Ok(statuses) => statuses.project_statuses,
+        Err(error) => {
+            ProjectStatusStageContinuation::pause_with_error(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                "target_validation_failed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let Some(target_status) = statuses
+        .into_iter()
+        .find(|status| status.id == target_status_id && !status.hidden)
+    else {
+        ProjectStatusStageContinuation::pause_with_error(
+            &deployment.db().pool,
+            continuation.id,
+            continuation.workflow_run_id,
+            "target_status_unavailable",
+            "The configured target status was deleted or hidden",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let mut issue = match client
+        .get_issue(continuation_issue_id(deployment, &continuation).await?)
+        .await
+    {
+        Ok(issue) => issue,
+        Err(error) => {
+            ProjectStatusStageContinuation::pause_with_error(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                "issue_load_failed",
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if issue.project_id != target_status.project_id {
+        ProjectStatusStageContinuation::pause_with_error(
+            &deployment.db().pool,
+            continuation.id,
+            continuation.workflow_run_id,
+            "target_status_mismatch",
+            "The configured target status belongs to another project",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if issue.status_id != target_status_id {
+        if issue.status_id != continuation.source_status_id {
+            ProjectStatusStageContinuation::mark_superseded(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                "The issue left the source status before automation could advance it",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let workflow = ProjectStatusWorkflowRun::find_by_id(
+            &deployment.db().pool,
+            continuation.workflow_run_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("Workflow run not found".to_string()))?;
+        if workflow.status != WorkflowRunStatus::Active {
+            return Ok(());
+        }
+
+        issue = match client
+            .update_issue(issue.id, &status_update_request(target_status_id))
+            .await
+        {
+            Ok(response) => response.data,
+            Err(error) => {
+                ProjectStatusStageContinuation::pause_with_error(
+                    &deployment.db().pool,
+                    continuation.id,
+                    continuation.workflow_run_id,
+                    "status_transition_failed",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    }
+
+    let result =
+        ProjectStatusStageResult::find_by_id(&deployment.db().pool, continuation.result_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Stage result not found".to_string()))?;
+    let target_automation =
+        ProjectStatusAutomation::find(&deployment.db().pool, issue.project_id, target_status_id)
+            .await?
+            .filter(|automation| automation.enabled);
+    let observation = observation_from_issue(&issue, result.workspace_id, true);
+    let outcome = ProjectStatusEntry::observe_in_workflow(
+        &deployment.db().pool,
+        issue.project_id,
+        &observation,
+        target_automation.as_ref(),
+        continuation.workflow_run_id,
+    )
+    .await
+    .map_err(stage_run_error_to_api)?;
+
+    ProjectStatusStageContinuation::mark_advanced(
+        &deployment.db().pool,
+        continuation.id,
+        issue.updated_at,
+    )
+    .await?;
+
+    if let Some(entry) = outcome.entry {
+        deployment
+            .events()
+            .msg_store()
+            .push_patch(project_status_entry_patch::add(&entry));
+    }
+    if let Some(stage_run) = outcome.stage_run {
+        deployment
+            .events()
+            .msg_store()
+            .push_patch(project_status_stage_run_patch::add(&stage_run));
+        let workflow_is_active = ProjectStatusWorkflowRun::find_by_id(
+            &deployment.db().pool,
+            continuation.workflow_run_id,
+        )
+        .await?
+        .is_some_and(|workflow| workflow.status == WorkflowRunStatus::Active);
+        if workflow_is_active
+            && target_automation
+                .as_ref()
+                .is_some_and(|automation| automation.start_mode == AutomationStartMode::Manual)
+        {
+            ProjectStatusWorkflowRun::set_status(
+                &deployment.db().pool,
+                continuation.workflow_run_id,
+                WorkflowRunStatus::AwaitingManual,
+                None,
+                None,
+            )
+            .await?;
+        } else if workflow_is_active && outcome.should_start {
+            start_stage_run(
+                deployment,
+                stage_run.id,
+                result.workspace_id,
+                Some(result.id),
+            )
+            .await?;
+        }
+    } else {
+        ProjectStatusWorkflowRun::set_status(
+            &deployment.db().pool,
+            continuation.workflow_run_id,
+            WorkflowRunStatus::Completed,
+            None,
+            None,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn continuation_issue_id(
+    deployment: &DeploymentImpl,
+    continuation: &ProjectStatusStageContinuation,
+) -> Result<Uuid, ApiError> {
+    Ok(
+        ProjectStatusWorkflowRun::find_by_id(&deployment.db().pool, continuation.workflow_run_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Workflow run not found".to_string()))?
+            .issue_id,
+    )
+}
+
+fn status_update_request(status_id: Uuid) -> UpdateIssueRequest {
+    UpdateIssueRequest {
+        status_id: Some(status_id),
+        title: None,
+        description: None,
+        priority: None,
+        start_date: None,
+        target_date: None,
+        completed_at: None,
+        sort_order: None,
+        parent_issue_id: None,
+        parent_issue_sort_order: None,
+        extension_metadata: None,
+    }
 }
 
 async fn observe_issue_statuses(
@@ -167,6 +646,36 @@ async fn get_issue_automation_state(
 ) -> Result<ResponseJson<ApiResponse<IssueAutomationState>>, ApiError> {
     let state = issue_automation_state(&deployment, remote_project_id, issue_id).await?;
     Ok(ResponseJson(ApiResponse::success(state)))
+}
+
+async fn pause_issue_automation(
+    State(deployment): State<DeploymentImpl>,
+    Path((remote_project_id, issue_id)): Path<(Uuid, Uuid)>,
+) -> Result<ResponseJson<ApiResponse<IssueAutomationState>>, ApiError> {
+    ProjectStatusWorkflowRun::pause_latest(&deployment.db().pool, remote_project_id, issue_id)
+        .await
+        .map_err(workflow_run_error_to_api)?;
+    Ok(ResponseJson(ApiResponse::success(
+        issue_automation_state(&deployment, remote_project_id, issue_id).await?,
+    )))
+}
+
+async fn resume_issue_automation(
+    State(deployment): State<DeploymentImpl>,
+    Path((remote_project_id, issue_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<ResumeProjectStatusAutomationRequest>,
+) -> Result<ResponseJson<ApiResponse<IssueAutomationState>>, ApiError> {
+    ProjectStatusWorkflowRun::resume_latest(
+        &deployment.db().pool,
+        remote_project_id,
+        issue_id,
+        request.transition_budget,
+    )
+    .await
+    .map_err(workflow_run_error_to_api)?;
+    Ok(ResponseJson(ApiResponse::success(
+        issue_automation_state(&deployment, remote_project_id, issue_id).await?,
+    )))
 }
 
 async fn start_issue_stage(
@@ -904,10 +1413,21 @@ async fn issue_automation_state(
     for stage_run in runs {
         stage_runs.push(stage_run_response(deployment, stage_run).await?);
     }
+    let workflow_runs =
+        ProjectStatusWorkflowRun::list_by_issue(&deployment.db().pool, remote_project_id, issue_id)
+            .await?;
+    let continuations = ProjectStatusStageContinuation::list_by_issue(
+        &deployment.db().pool,
+        remote_project_id,
+        issue_id,
+    )
+    .await?;
     Ok(IssueAutomationState {
         current_status_id,
         active_entry,
         stage_runs,
+        workflow_runs,
+        continuations,
     })
 }
 
@@ -951,6 +1471,13 @@ fn stage_run_error_to_api(error: StageRunError) -> ApiError {
     }
 }
 
+fn workflow_run_error_to_api(error: WorkflowRunError) -> ApiError {
+    match error {
+        WorkflowRunError::Database(error) => error.into(),
+        error => ApiError::BadRequest(error.to_string()),
+    }
+}
+
 fn database_start_failure(error: sqlx::Error) -> StageStartFailure {
     StageStartFailure::new("database_error", error.to_string())
 }
@@ -970,11 +1497,15 @@ async fn start_failure_repository_inputs(
     let Some(workspace) = Workspace::find_by_id(&deployment.db().pool, workspace_id).await? else {
         return Ok(Vec::new());
     };
-    let Some(workspace_root) = workspace.container_ref.as_deref().map(std::path::PathBuf::from)
+    let Some(workspace_root) = workspace
+        .container_ref
+        .as_deref()
+        .map(std::path::PathBuf::from)
     else {
         return Ok(Vec::new());
     };
-    let repos = WorkspaceRepo::find_repos_for_workspace(&deployment.db().pool, workspace_id).await?;
+    let repos =
+        WorkspaceRepo::find_repos_for_workspace(&deployment.db().pool, workspace_id).await?;
     let mut repositories =
         ProjectStatusStageAttempt::repository_inputs(&deployment.db().pool, attempt_id, &repos)
             .await?;
@@ -1007,15 +1538,19 @@ async fn start_failure_repository_inputs(
 mod tests {
     use api_types::Issue;
     use chrono::Utc;
-    use db::models::project_status_stage_result::{
-        ProjectStatusStageResult, ProjectStatusStageResultRepository,
-        ProjectStatusStageResultResponse, StageResultOutcome,
+    use db::models::{
+        project_status_automation::AutomationCompletionMode,
+        project_status_stage_result::{
+            ProjectStatusStageResult, ProjectStatusStageResultRepository,
+            ProjectStatusStageResultResponse, StageResultOutcome,
+        },
+        project_status_workflow::{StageContinuationStatus, WorkflowRunStatus},
     };
     use executors::{executors::BaseCodingAgent, profile::ExecutorProfileId};
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::build_stage_prompt;
+    use super::{build_stage_prompt, continuation_decision};
 
     fn issue() -> Issue {
         let now = Utc::now();
@@ -1101,5 +1636,69 @@ mod tests {
         let prompt = build_stage_prompt(&issue(), "", None);
         assert!(prompt.contains("Complete the task for this Kanban stage."));
         assert!(prompt.contains("No successful previous-stage result was selected."));
+    }
+
+    #[test]
+    fn only_substantive_success_can_advance() {
+        let target_status_id = Uuid::new_v4();
+
+        for outcome in [
+            StageResultOutcome::Failed,
+            StageResultOutcome::Killed,
+            StageResultOutcome::StartFailed,
+        ] {
+            let decision = continuation_decision(
+                outcome,
+                true,
+                AutomationCompletionMode::AdvanceOnSuccess,
+                Some(target_status_id),
+                Some(WorkflowRunStatus::Active),
+            );
+            assert_eq!(decision.0, StageContinuationStatus::Ineligible);
+            assert_eq!(decision.1, None);
+        }
+
+        let empty = continuation_decision(
+            StageResultOutcome::Completed,
+            false,
+            AutomationCompletionMode::AdvanceOnSuccess,
+            Some(target_status_id),
+            Some(WorkflowRunStatus::Active),
+        );
+        assert_eq!(empty.0, StageContinuationStatus::Ineligible);
+        assert_eq!(empty.2.as_deref(), Some("empty_result"));
+
+        let success = continuation_decision(
+            StageResultOutcome::Completed,
+            true,
+            AutomationCompletionMode::AdvanceOnSuccess,
+            Some(target_status_id),
+            Some(WorkflowRunStatus::Active),
+        );
+        assert_eq!(success.0, StageContinuationStatus::Pending);
+        assert_eq!(success.1, Some(target_status_id));
+    }
+
+    #[test]
+    fn stay_and_ended_workflows_never_enqueue_a_transition() {
+        let stayed = continuation_decision(
+            StageResultOutcome::Completed,
+            true,
+            AutomationCompletionMode::Stay,
+            Some(Uuid::new_v4()),
+            Some(WorkflowRunStatus::Active),
+        );
+        assert_eq!(stayed.0, StageContinuationStatus::Stayed);
+        assert_eq!(stayed.1, None);
+
+        let ended = continuation_decision(
+            StageResultOutcome::Completed,
+            true,
+            AutomationCompletionMode::AdvanceOnSuccess,
+            Some(Uuid::new_v4()),
+            Some(WorkflowRunStatus::Superseded),
+        );
+        assert_eq!(ended.0, StageContinuationStatus::Superseded);
+        assert_eq!(ended.1, None);
     }
 }

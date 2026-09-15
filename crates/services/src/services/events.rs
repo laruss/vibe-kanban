@@ -6,6 +6,7 @@ use db::{
         execution_process::ExecutionProcess,
         project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
         project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
+        project_status_workflow::{ProjectStatusStageContinuation, ProjectStatusWorkflowRun},
         scratch::Scratch,
         session::Session,
         workspace::Workspace,
@@ -26,7 +27,8 @@ pub mod types;
 
 pub use patches::{
     execution_process_patch, project_status_entry_patch, project_status_stage_attempt_patch,
-    project_status_stage_result_patch, project_status_stage_run_patch, scratch_patch,
+    project_status_stage_continuation_patch, project_status_stage_result_patch,
+    project_status_stage_run_patch, project_status_workflow_run_patch, scratch_patch,
     workspace_patch,
 };
 pub use types::{EventError, EventPatch, EventPatchInner, HookTables, RecordTypes};
@@ -250,6 +252,46 @@ impl EventService {
                                         }
                                     }
                                 }
+                                (HookTables::ProjectStatusWorkflowRuns, _) => {
+                                    match ProjectStatusWorkflowRun::find_by_rowid(
+                                        &db.pool, rowid,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(workflow_run)) => {
+                                            RecordTypes::ProjectStatusWorkflowRun(workflow_run)
+                                        }
+                                        Ok(None) => return,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to fetch project status workflow run: {:?}",
+                                                e
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                                (HookTables::ProjectStatusStageContinuations, _) => {
+                                    match ProjectStatusStageContinuation::find_by_rowid(
+                                        &db.pool, rowid,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(continuation)) => {
+                                            RecordTypes::ProjectStatusStageContinuation(
+                                                continuation,
+                                            )
+                                        }
+                                        Ok(None) => return,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to fetch project status stage continuation: {:?}",
+                                                e
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
                             };
 
                             let db_op: &str = match hook.operation {
@@ -359,6 +401,30 @@ impl EventService {
                                     msg_store_for_hook.push_patch(
                                         project_status_stage_result_patch::add(result),
                                     );
+                                    return;
+                                }
+                                RecordTypes::ProjectStatusWorkflowRun(workflow_run) => {
+                                    let patch = match hook.operation {
+                                        SqliteOperation::Insert => {
+                                            project_status_workflow_run_patch::add(workflow_run)
+                                        }
+                                        _ => project_status_workflow_run_patch::replace(workflow_run),
+                                    };
+                                    msg_store_for_hook.push_patch(patch);
+                                    return;
+                                }
+                                RecordTypes::ProjectStatusStageContinuation(continuation) => {
+                                    let patch = match hook.operation {
+                                        SqliteOperation::Insert => {
+                                            project_status_stage_continuation_patch::add(
+                                                continuation,
+                                            )
+                                        }
+                                        _ => project_status_stage_continuation_patch::replace(
+                                            continuation,
+                                        ),
+                                    };
+                                    msg_store_for_hook.push_patch(patch);
                                     return;
                                 }
                                 RecordTypes::DeletedExecutionProcess {

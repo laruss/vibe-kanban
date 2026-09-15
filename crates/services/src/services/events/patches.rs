@@ -2,6 +2,7 @@ use db::models::{
     execution_process::ExecutionProcess,
     project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
     project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
+    project_status_workflow::{ProjectStatusStageContinuation, ProjectStatusWorkflowRun},
     scratch::Scratch,
     workspace::WorkspaceWithStatus,
 };
@@ -119,6 +120,68 @@ pub mod project_status_stage_result_patch {
             .expect("Project status stage result path should be valid"),
             value: serde_json::to_value(result)
                 .expect("Project status stage result serialization should not fail"),
+        })])
+    }
+}
+
+pub mod project_status_workflow_run_patch {
+    use super::*;
+
+    fn workflow_run_path(workflow_run_id: Uuid) -> String {
+        format!(
+            "/project_status_workflow_runs/{}",
+            escape_pointer_segment(&workflow_run_id.to_string())
+        )
+    }
+
+    pub fn add(workflow_run: &ProjectStatusWorkflowRun) -> Patch {
+        Patch(vec![PatchOperation::Add(AddOperation {
+            path: workflow_run_path(workflow_run.id)
+                .try_into()
+                .expect("Project status workflow run path should be valid"),
+            value: serde_json::to_value(workflow_run)
+                .expect("Project status workflow run serialization should not fail"),
+        })])
+    }
+
+    pub fn replace(workflow_run: &ProjectStatusWorkflowRun) -> Patch {
+        Patch(vec![PatchOperation::Replace(ReplaceOperation {
+            path: workflow_run_path(workflow_run.id)
+                .try_into()
+                .expect("Project status workflow run path should be valid"),
+            value: serde_json::to_value(workflow_run)
+                .expect("Project status workflow run serialization should not fail"),
+        })])
+    }
+}
+
+pub mod project_status_stage_continuation_patch {
+    use super::*;
+
+    fn continuation_path(continuation_id: Uuid) -> String {
+        format!(
+            "/project_status_stage_continuations/{}",
+            escape_pointer_segment(&continuation_id.to_string())
+        )
+    }
+
+    pub fn add(continuation: &ProjectStatusStageContinuation) -> Patch {
+        Patch(vec![PatchOperation::Add(AddOperation {
+            path: continuation_path(continuation.id)
+                .try_into()
+                .expect("Project status stage continuation path should be valid"),
+            value: serde_json::to_value(continuation)
+                .expect("Project status stage continuation serialization should not fail"),
+        })])
+    }
+
+    pub fn replace(continuation: &ProjectStatusStageContinuation) -> Patch {
+        Patch(vec![PatchOperation::Replace(ReplaceOperation {
+            path: continuation_path(continuation.id)
+                .try_into()
+                .expect("Project status stage continuation path should be valid"),
+            value: serde_json::to_value(continuation)
+                .expect("Project status stage continuation serialization should not fail"),
         })])
     }
 }

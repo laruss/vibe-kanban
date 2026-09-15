@@ -10,6 +10,8 @@ use thiserror::Error;
 use ts_rs::TS;
 use uuid::Uuid;
 
+use super::project_status_workflow::{DEFAULT_TRANSITION_BUDGET, MAX_TRANSITION_BUDGET};
+
 pub const MAX_AUTOMATION_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -24,6 +26,7 @@ pub struct ProjectStatusAutomation {
     pub session_mode: AutomationSessionMode,
     pub completion_mode: AutomationCompletionMode,
     pub next_status_id: Option<Uuid>,
+    pub transition_budget: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -35,6 +38,8 @@ pub struct UpdateProjectStatusAutomation {
     pub session_mode: AutomationSessionMode,
     pub completion_mode: AutomationCompletionMode,
     pub next_status_id: Option<Uuid>,
+    #[serde(default = "default_transition_budget")]
+    pub transition_budget: i32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -99,6 +104,11 @@ pub enum ProjectStatusAutomationProblem {
     NextStatusRequired,
     NextStatusNotAllowed,
     NextStatusMatchesCurrent,
+    InvalidTransitionBudget {
+        min: i32,
+        max: i32,
+        actual: i32,
+    },
 }
 
 impl ProjectStatusAutomationProblem {
@@ -109,6 +119,7 @@ impl ProjectStatusAutomationProblem {
                 | Self::NextStatusRequired
                 | Self::NextStatusNotAllowed
                 | Self::NextStatusMatchesCurrent
+                | Self::InvalidTransitionBudget { .. }
         )
     }
 }
@@ -165,6 +176,7 @@ struct ProjectStatusAutomationRow {
     session_mode: String,
     completion_mode: String,
     next_status_id: Option<Uuid>,
+    transition_budget: i32,
 }
 
 impl ProjectStatusAutomation {
@@ -184,6 +196,7 @@ impl ProjectStatusAutomation {
             session_mode: update.session_mode,
             completion_mode: update.completion_mode,
             next_status_id: update.next_status_id,
+            transition_budget: update.transition_budget,
         }
     }
 
@@ -216,6 +229,14 @@ impl ProjectStatusAutomation {
                 problems.push(ProjectStatusAutomationProblem::NextStatusMatchesCurrent);
             }
             _ => {}
+        }
+
+        if !(1..=MAX_TRANSITION_BUDGET).contains(&self.transition_budget) {
+            problems.push(ProjectStatusAutomationProblem::InvalidTransitionBudget {
+                min: 1,
+                max: MAX_TRANSITION_BUDGET,
+                actual: self.transition_budget,
+            });
         }
 
         let status_validation = if let Some(project_status_ids) = project_status_ids {
@@ -262,7 +283,8 @@ impl ProjectStatusAutomation {
                       start_mode,
                       session_mode,
                       completion_mode,
-                      next_status_id
+                      next_status_id,
+                      transition_budget
                FROM project_status_automations
                WHERE remote_project_id = ? AND project_status_id = ?"#,
         )
@@ -289,7 +311,8 @@ impl ProjectStatusAutomation {
                       start_mode,
                       session_mode,
                       completion_mode,
-                      next_status_id
+                      next_status_id,
+                      transition_budget
                FROM project_status_automations
                WHERE remote_project_id = ?
                ORDER BY created_at, project_status_id"#,
@@ -317,8 +340,9 @@ impl ProjectStatusAutomation {
                     start_mode,
                     session_mode,
                     completion_mode,
-                    next_status_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    next_status_id,
+                    transition_budget
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_status_id) DO UPDATE SET
                     revision = project_status_automations.revision + 1,
                     enabled = excluded.enabled,
@@ -329,6 +353,7 @@ impl ProjectStatusAutomation {
                     session_mode = excluded.session_mode,
                     completion_mode = excluded.completion_mode,
                     next_status_id = excluded.next_status_id,
+                    transition_budget = excluded.transition_budget,
                     updated_at = datetime('now', 'subsec')
                 WHERE project_status_automations.remote_project_id = excluded.remote_project_id"#,
         )
@@ -342,6 +367,7 @@ impl ProjectStatusAutomation {
         .bind(self.session_mode.as_str())
         .bind(self.completion_mode.as_str())
         .bind(self.next_status_id)
+        .bind(self.transition_budget)
         .execute(&mut *transaction)
         .await?;
 
@@ -402,7 +428,7 @@ impl AutomationSessionMode {
 }
 
 impl AutomationCompletionMode {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Stay => "stay",
             Self::AdvanceOnSuccess => "advance_on_success",
@@ -428,8 +454,13 @@ impl TryFrom<ProjectStatusAutomationRow> for ProjectStatusAutomation {
             session_mode: parse_session_mode(&row.session_mode)?,
             completion_mode: parse_completion_mode(&row.completion_mode)?,
             next_status_id: row.next_status_id,
+            transition_budget: row.transition_budget,
         })
     }
+}
+
+const fn default_transition_budget() -> i32 {
+    DEFAULT_TRANSITION_BUDGET
 }
 
 fn validate_profile(
@@ -478,7 +509,7 @@ fn parse_session_mode(value: &str) -> Result<AutomationSessionMode, sqlx::Error>
     }
 }
 
-fn parse_completion_mode(value: &str) -> Result<AutomationCompletionMode, sqlx::Error> {
+pub(crate) fn parse_completion_mode(value: &str) -> Result<AutomationCompletionMode, sqlx::Error> {
     match value {
         "stay" => Ok(AutomationCompletionMode::Stay),
         "advance_on_success" => Ok(AutomationCompletionMode::AdvanceOnSuccess),
@@ -510,8 +541,8 @@ mod tests {
 
     use super::{
         AutomationCompletionMode, AutomationSessionMode, AutomationStartMode,
-        AutomationStatusReference, AutomationStatusValidation, MAX_AUTOMATION_INSTRUCTIONS_BYTES,
-        ProjectStatusAutomation, ProjectStatusAutomationProblem,
+        AutomationStatusReference, AutomationStatusValidation, DEFAULT_TRANSITION_BUDGET,
+        MAX_AUTOMATION_INSTRUCTIONS_BYTES, ProjectStatusAutomation, ProjectStatusAutomationProblem,
         ProjectStatusAutomationUpsertError, UpdateProjectStatusAutomation,
     };
 
@@ -540,6 +571,7 @@ mod tests {
                 session_mode: AutomationSessionMode::Fresh,
                 completion_mode: AutomationCompletionMode::Stay,
                 next_status_id: None,
+                transition_budget: DEFAULT_TRANSITION_BUDGET,
             },
         )
     }
@@ -671,6 +703,35 @@ mod tests {
         );
 
         config.next_status_id = Some(next_status_id);
+        assert!(
+            config
+                .validation(&profiles, Some(&statuses))
+                .problems
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transition_budget_is_bounded() {
+        let status_id = Uuid::new_v4();
+        let statuses = HashSet::from([status_id]);
+        let profiles = ExecutorConfigs::from_defaults();
+        let mut config = automation(Uuid::new_v4(), status_id);
+
+        config.transition_budget = 0;
+        assert!(matches!(
+            config
+                .validation(&profiles, Some(&statuses))
+                .problems
+                .as_slice(),
+            [ProjectStatusAutomationProblem::InvalidTransitionBudget {
+                min: 1,
+                max: 100,
+                actual: 0,
+            }]
+        ));
+
+        config.transition_budget = 100;
         assert!(
             config
                 .validation(&profiles, Some(&statuses))

@@ -8,6 +8,7 @@ pub mod project;
 pub mod project_status_automation;
 pub mod project_status_stage_result;
 pub mod project_status_stage_run;
+pub mod project_status_workflow;
 pub mod pull_request;
 pub mod repo;
 pub mod requests;

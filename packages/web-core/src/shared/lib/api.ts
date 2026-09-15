@@ -100,9 +100,10 @@ import {
   OpenRemoteWorkspaceInEditorRequest,
   OpenRemoteEditorResponse,
   ProfileResponse,
-  ProjectWorkflowConfigResponse,
-  UpdateProjectWorkflowConfig,
-  WorkflowConfigError,
+  ListProjectStatusAutomationsResponse,
+  ProjectStatusAutomationError,
+  ProjectStatusAutomationResponse,
+  UpdateProjectStatusAutomation,
 } from 'shared/types';
 import type { Project as RemoteProject } from 'shared/remote-types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -1489,31 +1490,55 @@ export const remoteProjectsApi = {
   },
 };
 
-export const projectWorkflowConfigsApi = {
-  get: async (
+export const projectStatusAutomationsApi = {
+  list: async (
     remoteProjectId: string
-  ): Promise<ProjectWorkflowConfigResponse> => {
+  ): Promise<ListProjectStatusAutomationsResponse> => {
     const response = await makeRequest(
-      `/api/projects/${remoteProjectId}/workflow-config`
+      `/api/projects/${remoteProjectId}/status-automations`
     );
-    return handleApiResponse<ProjectWorkflowConfigResponse>(response);
+    return handleApiResponse<ListProjectStatusAutomationsResponse>(response);
+  },
+
+  get: async (
+    remoteProjectId: string,
+    projectStatusId: string
+  ): Promise<ProjectStatusAutomationResponse | null> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/statuses/${projectStatusId}/automation`
+    );
+    return handleApiResponse<ProjectStatusAutomationResponse | null>(response);
   },
 
   update: async (
     remoteProjectId: string,
-    config: UpdateProjectWorkflowConfig
-  ): Promise<Result<ProjectWorkflowConfigResponse, WorkflowConfigError>> => {
+    projectStatusId: string,
+    automation: UpdateProjectStatusAutomation
+  ): Promise<
+    Result<ProjectStatusAutomationResponse, ProjectStatusAutomationError>
+  > => {
     const response = await makeRequest(
-      `/api/projects/${remoteProjectId}/workflow-config`,
+      `/api/projects/${remoteProjectId}/statuses/${projectStatusId}/automation`,
       {
         method: 'PUT',
-        body: JSON.stringify(config),
+        body: JSON.stringify(automation),
       }
     );
     return handleApiResponseAsResult<
-      ProjectWorkflowConfigResponse,
-      WorkflowConfigError
+      ProjectStatusAutomationResponse,
+      ProjectStatusAutomationError
     >(response);
+  },
+
+  delete: async (
+    remoteProjectId: string,
+    projectStatusId: string
+  ): Promise<void> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/statuses/${projectStatusId}/automation`,
+      { method: 'DELETE' }
+    );
+    return handleApiResponse<void>(response);
   },
 };
 

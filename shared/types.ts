@@ -8,15 +8,27 @@ export type Repo = { id: string, path: string, name: string, display_name: strin
 
 export type Project = { id: string, name: string, default_agent_working_dir: string | null, remote_project_id: string | null, created_at: Date, updated_at: Date, };
 
-export type ProjectWorkflowConfig = { remote_project_id: string, enabled: boolean, implementation_profile_id: ExecutorProfileId, review_profile_id: ExecutorProfileId, implementation_instructions: string, review_instructions: string, auto_advance: boolean, allow_human_override: boolean, };
+export type ProjectStatusAutomation = { remote_project_id: string, project_status_id: string, enabled: boolean, executor_profile_id: ExecutorProfileId, instructions: string, start_mode: AutomationStartMode, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, };
 
-export type UpdateProjectWorkflowConfig = { enabled: boolean, implementation_profile_id: ExecutorProfileId, review_profile_id: ExecutorProfileId, implementation_instructions: string, review_instructions: string, auto_advance: boolean, allow_human_override: boolean, };
+export type UpdateProjectStatusAutomation = { enabled: boolean, executor_profile_id: ExecutorProfileId, instructions: string, start_mode: AutomationStartMode, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, };
 
-export type ProjectWorkflowConfigResponse = { config: ProjectWorkflowConfig, problems: Array<WorkflowConfigProblem>, };
+export type AutomationStartMode = "manual" | "on_enter";
 
-export type WorkflowConfigProblem = { "type": "missing_profile", role: WorkflowRole, profile_id: ExecutorProfileId, } | { "type": "executor_role_mismatch", role: WorkflowRole, profile_id: ExecutorProfileId, expected_executor: BaseCodingAgent, actual_executor: BaseCodingAgent, } | { "type": "instructions_too_long", role: WorkflowRole, max_bytes: number, actual_bytes: number, };
+export type AutomationSessionMode = "fresh" | "continue_if_compatible";
 
-export type WorkflowRole = "implementation" | "review";
+export type AutomationCompletionMode = "stay" | "advance_on_success";
+
+export type AutomationStatusReference = "current" | "next";
+
+export type AutomationStatusValidation = "checked" | "unavailable";
+
+export type ProjectStatusAutomationProblem = { "type": "missing_profile", profile_id: ExecutorProfileId, } | { "type": "executor_type_mismatch", profile_id: ExecutorProfileId, actual_executor: BaseCodingAgent, } | { "type": "instructions_too_long", max_bytes: number, actual_bytes: number, } | { "type": "status_not_found_in_project", reference: AutomationStatusReference, status_id: string, } | { "type": "next_status_required" } | { "type": "next_status_not_allowed" } | { "type": "next_status_matches_current" };
+
+export type ProjectStatusAutomationValidation = { problems: Array<ProjectStatusAutomationProblem>, status_validation: AutomationStatusValidation, };
+
+export type ProjectStatusAutomationResponse = { automation: ProjectStatusAutomation, validation: ProjectStatusAutomationValidation, };
+
+export type ListProjectStatusAutomationsResponse = { automations: Array<ProjectStatusAutomationResponse>, };
 
 export type UpdateRepo = { display_name?: string | null, setup_script?: string | null, cleanup_script?: string | null, archive_script?: string | null, copy_files?: string | null, parallel_setup_script?: boolean | null, dev_server_script?: string | null, default_target_branch?: string | null, default_working_dir?: string | null, };
 
@@ -272,7 +284,7 @@ export type RegisterRepoRequest = { path: string, display_name: string | null, }
 
 export type InitRepoRequest = { parent_path: string, folder_name: string, };
 
-export type WorkflowConfigError = { "type": "validation_failed", problems: Array<WorkflowConfigProblem>, };
+export type ProjectStatusAutomationError = { "type": "validation_failed", validation: ProjectStatusAutomationValidation, } | { "type": "status_ownership_conflict", project_status_id: string, };
 
 export type TagSearchParams = { search: string | null, };
 

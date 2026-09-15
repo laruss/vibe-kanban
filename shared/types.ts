@@ -8,9 +8,9 @@ export type Repo = { id: string, path: string, name: string, display_name: strin
 
 export type Project = { id: string, name: string, default_agent_working_dir: string | null, remote_project_id: string | null, created_at: Date, updated_at: Date, };
 
-export type ProjectStatusAutomation = { remote_project_id: string, project_status_id: string, revision: bigint, enabled: boolean, executor_profile_id: ExecutorProfileId, instructions: string, start_mode: AutomationStartMode, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, };
+export type ProjectStatusAutomation = { remote_project_id: string, project_status_id: string, revision: bigint, enabled: boolean, executor_profile_id: ExecutorProfileId, instructions: string, start_mode: AutomationStartMode, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, transition_budget: number, };
 
-export type UpdateProjectStatusAutomation = { enabled: boolean, executor_profile_id: ExecutorProfileId, instructions: string, start_mode: AutomationStartMode, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, };
+export type UpdateProjectStatusAutomation = { enabled: boolean, executor_profile_id: ExecutorProfileId, instructions: string, start_mode: AutomationStartMode, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, transition_budget: number, };
 
 export type AutomationStartMode = "manual" | "on_enter";
 
@@ -22,7 +22,7 @@ export type AutomationStatusReference = "current" | "next";
 
 export type AutomationStatusValidation = "checked" | "unavailable";
 
-export type ProjectStatusAutomationProblem = { "type": "missing_profile", profile_id: ExecutorProfileId, } | { "type": "executor_type_mismatch", profile_id: ExecutorProfileId, actual_executor: BaseCodingAgent, } | { "type": "instructions_too_long", max_bytes: number, actual_bytes: number, } | { "type": "status_not_found_in_project", reference: AutomationStatusReference, status_id: string, } | { "type": "next_status_required" } | { "type": "next_status_not_allowed" } | { "type": "next_status_matches_current" };
+export type ProjectStatusAutomationProblem = { "type": "missing_profile", profile_id: ExecutorProfileId, } | { "type": "executor_type_mismatch", profile_id: ExecutorProfileId, actual_executor: BaseCodingAgent, } | { "type": "instructions_too_long", max_bytes: number, actual_bytes: number, } | { "type": "status_not_found_in_project", reference: AutomationStatusReference, status_id: string, } | { "type": "next_status_required" } | { "type": "next_status_not_allowed" } | { "type": "next_status_matches_current" } | { "type": "invalid_transition_budget", min: number, max: number, actual: number, };
 
 export type ProjectStatusAutomationValidation = { problems: Array<ProjectStatusAutomationProblem>, status_validation: AutomationStatusValidation, };
 
@@ -40,11 +40,11 @@ export type StageRunStatus = "pending" | "starting" | "running" | "completed" | 
 
 export type ProjectStatusEntry = { id: string, remote_project_id: string, issue_id: string, project_status_id: string, issue_updated_at: string, simple_id: string, title: string, description: string | null, entry_kind: StatusEntryKind, preferred_workspace_id: string | null, exited_at: string | null, created_at: string, updated_at: string, };
 
-export type ProjectStatusStageRun = { id: string, status_entry_id: string, remote_project_id: string, issue_id: string, project_status_id: string, automation_revision: bigint, trigger: StageRunTrigger, status: StageRunStatus, executor_profile_id: ExecutorProfileId, instructions: string, session_mode: AutomationSessionMode, workspace_id: string | null, session_id: string | null, error_code: string | null, error_message: string | null, started_at: string | null, completed_at: string | null, created_at: string, updated_at: string, };
+export type ProjectStatusStageRun = { id: string, status_entry_id: string, remote_project_id: string, issue_id: string, project_status_id: string, automation_revision: bigint, workflow_run_id: string | null, trigger: StageRunTrigger, status: StageRunStatus, executor_profile_id: ExecutorProfileId, instructions: string, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, transition_budget: number, workspace_id: string | null, session_id: string | null, error_code: string | null, error_message: string | null, started_at: string | null, completed_at: string | null, created_at: string, updated_at: string, };
 
 export type ProjectStatusStageRunResponse = { stage_run: ProjectStatusStageRun, execution_process_ids: Array<string>, attempts: Array<ProjectStatusStageAttemptResponse>, };
 
-export type IssueAutomationState = { current_status_id: string | null, active_entry: ProjectStatusEntry | null, stage_runs: Array<ProjectStatusStageRunResponse>, };
+export type IssueAutomationState = { current_status_id: string | null, active_entry: ProjectStatusEntry | null, stage_runs: Array<ProjectStatusStageRunResponse>, workflow_runs: Array<ProjectStatusWorkflowRun>, continuations: Array<ProjectStatusStageContinuation>, };
 
 export type ProjectStatusStageAttempt = { id: string, stage_run_id: string, attempt_number: bigint, input_result_id: string | null, status: StageRunStatus, executor_profile_id: ExecutorProfileId, automation_revision: bigint, workspace_id: string | null, session_id: string | null, rendered_prompt: string | null, prompt_schema_version: bigint, error_code: string | null, error_message: string | null, started_at: string, completed_at: string | null, created_at: string, updated_at: string, };
 
@@ -57,6 +57,14 @@ export type ProjectStatusStageResultRepository = { result_id: string, repo_id: s
 export type ProjectStatusStageResultResponse = { result: ProjectStatusStageResult, execution_process_ids: Array<string>, repositories: Array<ProjectStatusStageResultRepository>, };
 
 export type ProjectStatusStageAttemptResponse = { attempt: ProjectStatusStageAttempt, execution_process_ids: Array<string>, result: ProjectStatusStageResultResponse | null, };
+
+export type WorkflowRunStatus = "active" | "paused" | "awaiting_manual" | "completed" | "superseded";
+
+export type ProjectStatusWorkflowRun = { id: string, remote_project_id: string, issue_id: string, status: WorkflowRunStatus, transition_budget: number, transitions_used: number, error_code: string | null, error_message: string | null, started_at: string, completed_at: string | null, created_at: string, updated_at: string, };
+
+export type StageContinuationStatus = "stayed" | "ineligible" | "pending" | "applying" | "advanced" | "paused" | "superseded";
+
+export type ProjectStatusStageContinuation = { id: string, result_id: string, workflow_run_id: string, source_stage_run_id: string, source_status_id: string, target_status_id: string | null, status: StageContinuationStatus, budget_reserved: boolean, error_code: string | null, error_message: string | null, remote_issue_updated_at: string | null, claimed_at: string | null, completed_at: string | null, created_at: string, updated_at: string, };
 
 export type UpdateRepo = { display_name?: string | null, setup_script?: string | null, cleanup_script?: string | null, archive_script?: string | null, copy_files?: string | null, parallel_setup_script?: boolean | null, dev_server_script?: string | null, default_target_branch?: string | null, default_working_dir?: string | null, };
 
@@ -319,6 +327,8 @@ export type ObserveIssueStatusesRequest = { observations: Array<IssueStatusObser
 export type ObserveIssueStatusesResponse = { status_entry_ids: Array<string>, stage_run_ids: Array<string>, };
 
 export type StartProjectStatusStageRequest = { workspace_id: string | null, input_result_id: string | null, };
+
+export type ResumeProjectStatusAutomationRequest = { transition_budget: number | null, };
 
 export type TagSearchParams = { search: string | null, };
 

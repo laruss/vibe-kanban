@@ -3,6 +3,7 @@ use db::models::{
     execution_process::ExecutionProcess,
     project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
     project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
+    project_status_workflow::{ProjectStatusStageContinuation, ProjectStatusWorkflowRun},
     scratch::Scratch,
     workspace::Workspace,
 };
@@ -37,6 +38,10 @@ pub enum HookTables {
     ProjectStatusStageAttempts,
     #[strum(to_string = "project_status_stage_results")]
     ProjectStatusStageResults,
+    #[strum(to_string = "project_status_workflow_runs")]
+    ProjectStatusWorkflowRuns,
+    #[strum(to_string = "project_status_stage_continuations")]
+    ProjectStatusStageContinuations,
     #[strum(to_string = "scratch")]
     Scratch,
 }
@@ -50,6 +55,8 @@ pub enum RecordTypes {
     ProjectStatusStageRun(ProjectStatusStageRun),
     ProjectStatusStageAttempt(ProjectStatusStageAttempt),
     ProjectStatusStageResult(ProjectStatusStageResult),
+    ProjectStatusWorkflowRun(ProjectStatusWorkflowRun),
+    ProjectStatusStageContinuation(ProjectStatusStageContinuation),
     Scratch(Scratch),
     DeletedWorkspace {
         rowid: i64,

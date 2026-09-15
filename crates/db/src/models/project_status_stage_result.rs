@@ -9,8 +9,7 @@ use uuid::Uuid;
 
 use super::{
     execution_process_repo_state::ExecutionProcessRepoState,
-    project_status_stage_run::StageRunStatus,
-    repo::Repo,
+    project_status_stage_run::StageRunStatus, repo::Repo,
 };
 
 pub const STAGE_PROMPT_SCHEMA_VERSION: i64 = 1;
@@ -360,6 +359,48 @@ impl ProjectStatusStageResult {
                 .fetch_optional(pool)
                 .await?;
         row.map(Self::try_from).transpose()
+    }
+
+    pub async fn list_without_continuation(pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ProjectStatusStageResultRow>(&format!(
+            r#"{} AND EXISTS (
+                    SELECT 1 FROM project_status_stage_runs sr
+                    WHERE sr.id = project_status_stage_results.stage_run_id
+                      AND sr.workflow_run_id IS NOT NULL
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM project_status_stage_continuations c
+                    WHERE c.result_id = project_status_stage_results.id
+                ) ORDER BY completed_at, created_at LIMIT 32"#,
+            Self::select_sql("1 = 1")
+        ))
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter().map(Self::try_from).collect()
+    }
+
+    pub async fn has_substantive_output(&self, pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+        if self
+            .summary
+            .as_deref()
+            .is_some_and(|summary| !summary.trim().is_empty())
+        {
+            return Ok(true);
+        }
+
+        if ProjectStatusStageAttempt::execution_process_ids(pool, self.attempt_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+
+        Ok(Self::repositories(pool, self.id).await?.iter().any(|repo| {
+            repo.has_uncommitted_changes == Some(true)
+                || matches!(
+                    (&repo.base_head_commit, &repo.resulting_head_commit),
+                    (Some(base), Some(result)) if base != result
+                )
+        }))
     }
 
     pub async fn latest_successful_for_issue_workspace(

@@ -36,6 +36,8 @@ pub mod webrtc;
 pub mod workspaces;
 
 pub fn router(deployment: DeploymentImpl) -> IntoMakeService<Router> {
+    project_status_stage_runs::spawn_workflow_worker(deployment.clone());
+
     let relay_signed_routes = Router::new()
         .route("/health", get(health::health_check))
         .merge(config::router())

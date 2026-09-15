@@ -108,6 +108,7 @@ import {
   ObserveIssueStatusesRequest,
   ObserveIssueStatusesResponse,
   ProjectStatusStageRunResponse,
+  ResumeProjectStatusAutomationRequest,
   StartProjectStatusStageRequest,
 } from 'shared/types';
 import type { Project as RemoteProject } from 'shared/remote-types';
@@ -1585,6 +1586,47 @@ export const projectStatusStageRunsApi = {
       }
     );
     return handleApiResponse<ProjectStatusStageRunResponse>(response);
+  },
+
+  retry: async (
+    remoteProjectId: string,
+    issueId: string,
+    request: StartProjectStatusStageRequest
+  ): Promise<ProjectStatusStageRunResponse> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/issues/${issueId}/automation/retry`,
+      {
+        method: 'POST',
+        body: JSON.stringify(request),
+      }
+    );
+    return handleApiResponse<ProjectStatusStageRunResponse>(response);
+  },
+
+  pause: async (
+    remoteProjectId: string,
+    issueId: string
+  ): Promise<IssueAutomationState> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/issues/${issueId}/automation/pause`,
+      { method: 'POST' }
+    );
+    return handleApiResponse<IssueAutomationState>(response);
+  },
+
+  resume: async (
+    remoteProjectId: string,
+    issueId: string,
+    request: ResumeProjectStatusAutomationRequest
+  ): Promise<IssueAutomationState> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/issues/${issueId}/automation/resume`,
+      {
+        method: 'POST',
+        body: JSON.stringify(request),
+      }
+    );
+    return handleApiResponse<IssueAutomationState>(response);
   },
 };
 

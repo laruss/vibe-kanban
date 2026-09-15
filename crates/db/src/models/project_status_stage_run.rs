@@ -11,9 +11,11 @@ use uuid::Uuid;
 use super::{
     execution_process::{ExecutionProcessRunReason, ExecutionProcessStatus},
     project_status_automation::{
-        AutomationSessionMode, AutomationStartMode, ProjectStatusAutomation,
+        AutomationCompletionMode, AutomationSessionMode, AutomationStartMode,
+        ProjectStatusAutomation,
     },
     project_status_stage_result::{ProjectStatusStageAttemptResponse, STAGE_PROMPT_SCHEMA_VERSION},
+    project_status_workflow::{ProjectStatusStageContinuation, ProjectStatusWorkflowRun},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -84,11 +86,15 @@ pub struct ProjectStatusStageRun {
     pub issue_id: Uuid,
     pub project_status_id: Uuid,
     pub automation_revision: i64,
+    pub workflow_run_id: Option<Uuid>,
     pub trigger: StageRunTrigger,
     pub status: StageRunStatus,
     pub executor_profile_id: ExecutorProfileId,
     pub instructions: String,
     pub session_mode: AutomationSessionMode,
+    pub completion_mode: AutomationCompletionMode,
+    pub next_status_id: Option<Uuid>,
+    pub transition_budget: i32,
     pub workspace_id: Option<Uuid>,
     pub session_id: Option<Uuid>,
     pub error_code: Option<String>,
@@ -111,6 +117,8 @@ pub struct IssueAutomationState {
     pub current_status_id: Option<Uuid>,
     pub active_entry: Option<ProjectStatusEntry>,
     pub stage_runs: Vec<ProjectStatusStageRunResponse>,
+    pub workflow_runs: Vec<ProjectStatusWorkflowRun>,
+    pub continuations: Vec<ProjectStatusStageContinuation>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,12 +174,16 @@ struct ProjectStatusStageRunRow {
     issue_id: Uuid,
     project_status_id: Uuid,
     automation_revision: i64,
+    workflow_run_id: Option<Uuid>,
     trigger: String,
     status: String,
     executor: String,
     executor_variant: Option<String>,
     instructions: String,
     session_mode: String,
+    completion_mode: String,
+    next_status_id: Option<Uuid>,
+    transition_budget: i32,
     workspace_id: Option<Uuid>,
     session_id: Option<Uuid>,
     error_code: Option<String>,
@@ -188,6 +200,33 @@ impl ProjectStatusEntry {
         remote_project_id: Uuid,
         observation: &IssueStatusObservation,
         automation: Option<&ProjectStatusAutomation>,
+    ) -> Result<ObserveStatusOutcome, StageRunError> {
+        Self::observe_with_workflow(pool, remote_project_id, observation, automation, None).await
+    }
+
+    pub async fn observe_in_workflow(
+        pool: &SqlitePool,
+        remote_project_id: Uuid,
+        observation: &IssueStatusObservation,
+        automation: Option<&ProjectStatusAutomation>,
+        workflow_run_id: Uuid,
+    ) -> Result<ObserveStatusOutcome, StageRunError> {
+        Self::observe_with_workflow(
+            pool,
+            remote_project_id,
+            observation,
+            automation,
+            Some(workflow_run_id),
+        )
+        .await
+    }
+
+    async fn observe_with_workflow(
+        pool: &SqlitePool,
+        remote_project_id: Uuid,
+        observation: &IssueStatusObservation,
+        automation: Option<&ProjectStatusAutomation>,
+        requested_workflow_run_id: Option<Uuid>,
     ) -> Result<ObserveStatusOutcome, StageRunError> {
         let mut transaction = pool.begin().await?;
         let previous = sqlx::query_as::<_, IssueStatusObservationRow>(
@@ -265,6 +304,7 @@ impl ProjectStatusEntry {
                             AutomationStartMode::Manual => StageRunTrigger::Manual,
                             AutomationStartMode::OnEnter => StageRunTrigger::OnEnter,
                         },
+                        requested_workflow_run_id,
                     )
                     .await?;
                     let should_start = automation.start_mode == AutomationStartMode::OnEnter
@@ -290,6 +330,31 @@ impl ProjectStatusEntry {
             .as_ref()
             .is_some_and(|previous| previous.project_status_id != observation.project_status_id);
         let first_observation = previous.is_none();
+        let workflow_run_id = if let Some(workflow_run_id) = requested_workflow_run_id {
+            Some(workflow_run_id)
+        } else if status_changed {
+            ProjectStatusStageContinuation::workflow_for_observed_transition_in_transaction(
+                &mut transaction,
+                observation.issue_id,
+                previous
+                    .as_ref()
+                    .expect("a changed status has a previous observation")
+                    .project_status_id,
+                observation.project_status_id,
+            )
+            .await?
+        } else {
+            None
+        };
+
+        if status_changed && workflow_run_id.is_none() {
+            ProjectStatusWorkflowRun::supersede_open_for_issue_in_transaction(
+                &mut transaction,
+                remote_project_id,
+                observation.issue_id,
+            )
+            .await?;
+        }
 
         sqlx::query(
             r#"INSERT INTO issue_status_observations (
@@ -377,6 +442,7 @@ impl ProjectStatusEntry {
                         AutomationStartMode::Manual => StageRunTrigger::Manual,
                         AutomationStartMode::OnEnter => StageRunTrigger::OnEnter,
                     },
+                    workflow_run_id,
                 )
                 .await?,
             )
@@ -559,14 +625,16 @@ impl ProjectStatusStageRun {
         entry: &ProjectStatusEntry,
         automation: &ProjectStatusAutomation,
         trigger: StageRunTrigger,
+        workflow_run_id: Option<Uuid>,
     ) -> Result<Self, StageRunError> {
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO project_status_stage_runs (
                     id, status_entry_id, remote_project_id, issue_id,
-                    project_status_id, automation_revision, trigger, status, executor,
-                    executor_variant, instructions, session_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    project_status_id, automation_revision, workflow_run_id,
+                    trigger, status, executor, executor_variant, instructions,
+                    session_mode, completion_mode, next_status_id, transition_budget
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(status_entry_id) DO NOTHING"#,
         )
         .bind(id)
@@ -575,13 +643,30 @@ impl ProjectStatusStageRun {
         .bind(entry.issue_id)
         .bind(entry.project_status_id)
         .bind(automation.revision)
+        .bind(workflow_run_id)
         .bind(trigger.as_str())
         .bind(automation.executor_profile_id.executor.to_string())
         .bind(&automation.executor_profile_id.variant)
         .bind(&automation.instructions)
         .bind(automation.session_mode.as_str())
+        .bind(automation.completion_mode.as_str())
+        .bind(automation.next_status_id)
+        .bind(automation.transition_budget)
         .execute(&mut **transaction)
         .await?;
+
+        if let Some(workflow_run_id) = workflow_run_id {
+            sqlx::query(
+                r#"UPDATE project_status_stage_runs
+                   SET workflow_run_id = COALESCE(workflow_run_id, ?),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE status_entry_id = ?"#,
+            )
+            .bind(workflow_run_id)
+            .bind(entry.id)
+            .execute(&mut **transaction)
+            .await?;
+        }
 
         let row = Self::find_row_by_entry(&mut **transaction, entry.id).await?;
         Self::try_from(row).map_err(StageRunError::Database)
@@ -594,9 +679,14 @@ impl ProjectStatusStageRun {
         trigger: StageRunTrigger,
     ) -> Result<Self, StageRunError> {
         let mut transaction = pool.begin().await?;
-        let stage_run =
-            Self::ensure_for_entry_in_transaction(&mut transaction, entry, automation, trigger)
-                .await?;
+        let stage_run = Self::ensure_for_entry_in_transaction(
+            &mut transaction,
+            entry,
+            automation,
+            trigger,
+            None,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(stage_run)
     }
@@ -617,9 +707,10 @@ impl ProjectStatusStageRun {
     fn select_sql(predicate: &str) -> String {
         format!(
             r#"SELECT id, status_entry_id, remote_project_id, issue_id,
-                      project_status_id, automation_revision, trigger, status, executor,
-                      executor_variant, instructions, session_mode, workspace_id,
-                      session_id, error_code, error_message, started_at,
+                      project_status_id, automation_revision, workflow_run_id,
+                      trigger, status, executor, executor_variant, instructions,
+                      session_mode, completion_mode, next_status_id, transition_budget,
+                      workspace_id, session_id, error_code, error_message, started_at,
                       completed_at, created_at, updated_at
                FROM project_status_stage_runs WHERE {predicate}"#
         )
@@ -657,6 +748,21 @@ impl ProjectStatusStageRun {
         rows.into_iter().map(Self::try_from).collect()
     }
 
+    pub async fn list_pending_on_enter_for_active_workflows(
+        pool: &SqlitePool,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ProjectStatusStageRunRow>(&format!(
+            r#"{} AND trigger = 'on_enter' AND status = 'pending'
+                AND workflow_run_id IN (
+                    SELECT id FROM project_status_workflow_runs WHERE status = 'active'
+                ) ORDER BY created_at LIMIT 32"#,
+            Self::select_sql("1 = 1")
+        ))
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter().map(Self::try_from).collect()
+    }
+
     pub async fn claim_start(pool: &SqlitePool, id: Uuid) -> Result<Self, StageRunError> {
         let mut transaction = pool.begin().await?;
         let result = sqlx::query(
@@ -665,7 +771,21 @@ impl ProjectStatusStageRun {
                    started_at = COALESCE(started_at, datetime('now', 'subsec')),
                    completed_at = NULL,
                    updated_at = datetime('now', 'subsec')
-               WHERE id = ? AND status IN ('pending', 'start_failed')"#,
+               WHERE id = ? AND (
+                   status IN ('pending', 'start_failed', 'failed', 'killed')
+                   OR (
+                       status = 'completed'
+                       AND (
+                           SELECT c.status
+                           FROM project_status_stage_attempts a
+                           JOIN project_status_stage_results r ON r.attempt_id = a.id
+                           JOIN project_status_stage_continuations c ON c.result_id = r.id
+                           WHERE a.stage_run_id = project_status_stage_runs.id
+                           ORDER BY a.attempt_number DESC
+                           LIMIT 1
+                       ) = 'ineligible'
+                   )
+               )"#,
         )
         .bind(id)
         .execute(&mut *transaction)
@@ -677,6 +797,8 @@ impl ProjectStatusStageRun {
                 .ok_or(StageRunError::StageRunNotFound)?;
             return Err(StageRunError::CannotStart(stage_run.status));
         }
+
+        ProjectStatusWorkflowRun::ensure_for_stage_run_in_transaction(&mut transaction, id).await?;
 
         let attempt_id = Uuid::new_v4();
         sqlx::query(
@@ -1060,6 +1182,7 @@ impl TryFrom<ProjectStatusStageRunRow> for ProjectStatusStageRun {
             issue_id: row.issue_id,
             project_status_id: row.project_status_id,
             automation_revision: row.automation_revision,
+            workflow_run_id: row.workflow_run_id,
             trigger: parse_trigger(&row.trigger)?,
             status: parse_status(&row.status)?,
             executor_profile_id: ExecutorProfileId {
@@ -1070,6 +1193,11 @@ impl TryFrom<ProjectStatusStageRunRow> for ProjectStatusStageRun {
             },
             instructions: row.instructions,
             session_mode: parse_session_mode(&row.session_mode)?,
+            completion_mode: super::project_status_automation::parse_completion_mode(
+                &row.completion_mode,
+            )?,
+            next_status_id: row.next_status_id,
+            transition_budget: row.transition_budget,
             workspace_id: row.workspace_id,
             session_id: row.session_id,
             error_code: row.error_code,
@@ -1189,6 +1317,7 @@ mod tests {
             session_mode: AutomationSessionMode::Fresh,
             completion_mode: AutomationCompletionMode::Stay,
             next_status_id: None,
+            transition_budget: 10,
         }
     }
 
@@ -1367,7 +1496,8 @@ mod tests {
         let project_id = uuid::Uuid::new_v4();
         let issue_id = uuid::Uuid::new_v4();
         let status_id = uuid::Uuid::new_v4();
-        let automation = automation(project_id, status_id, AutomationStartMode::Manual);
+        let mut automation = automation(project_id, status_id, AutomationStartMode::Manual);
+        automation.transition_budget = 7;
 
         let outcome = ProjectStatusEntry::observe(
             &pool,
@@ -1381,13 +1511,14 @@ mod tests {
 
         assert!(!outcome.should_start);
         assert_eq!(stage_run.status, StageRunStatus::Pending);
-        assert_eq!(
-            ProjectStatusStageRun::claim_start(&pool, stage_run.id)
-                .await
-                .unwrap()
-                .status,
-            StageRunStatus::Starting
-        );
+        assert_eq!(stage_run.completion_mode, AutomationCompletionMode::Stay);
+        assert_eq!(stage_run.transition_budget, 7);
+        assert!(stage_run.workflow_run_id.is_none());
+        let claimed = ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
+        assert_eq!(claimed.status, StageRunStatus::Starting);
+        assert!(claimed.workflow_run_id.is_some());
         assert!(matches!(
             ProjectStatusStageRun::claim_start(&pool, stage_run.id).await,
             Err(StageRunError::CannotStart(StageRunStatus::Starting))

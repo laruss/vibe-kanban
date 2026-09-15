@@ -100,6 +100,9 @@ import {
   OpenRemoteWorkspaceInEditorRequest,
   OpenRemoteEditorResponse,
   ProfileResponse,
+  ProjectWorkflowConfigResponse,
+  UpdateProjectWorkflowConfig,
+  WorkflowConfigError,
 } from 'shared/types';
 import type { Project as RemoteProject } from 'shared/remote-types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -1483,6 +1486,34 @@ export const remoteProjectsApi = {
     const result =
       await handleApiResponse<ListRemoteProjectsResponse>(response);
     return result.projects;
+  },
+};
+
+export const projectWorkflowConfigsApi = {
+  get: async (
+    remoteProjectId: string
+  ): Promise<ProjectWorkflowConfigResponse> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/workflow-config`
+    );
+    return handleApiResponse<ProjectWorkflowConfigResponse>(response);
+  },
+
+  update: async (
+    remoteProjectId: string,
+    config: UpdateProjectWorkflowConfig
+  ): Promise<Result<ProjectWorkflowConfigResponse, WorkflowConfigError>> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/workflow-config`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(config),
+      }
+    );
+    return handleApiResponseAsResult<
+      ProjectWorkflowConfigResponse,
+      WorkflowConfigError
+    >(response);
   },
 };
 

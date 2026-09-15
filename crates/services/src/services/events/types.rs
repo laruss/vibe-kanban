@@ -1,6 +1,7 @@
 use anyhow::Error as AnyhowError;
 use db::models::{
     execution_process::ExecutionProcess,
+    project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
     project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
     scratch::Scratch,
     workspace::Workspace,
@@ -32,6 +33,10 @@ pub enum HookTables {
     ProjectStatusEntries,
     #[strum(to_string = "project_status_stage_runs")]
     ProjectStatusStageRuns,
+    #[strum(to_string = "project_status_stage_attempts")]
+    ProjectStatusStageAttempts,
+    #[strum(to_string = "project_status_stage_results")]
+    ProjectStatusStageResults,
     #[strum(to_string = "scratch")]
     Scratch,
 }
@@ -43,6 +48,8 @@ pub enum RecordTypes {
     ExecutionProcess(ExecutionProcess),
     ProjectStatusEntry(ProjectStatusEntry),
     ProjectStatusStageRun(ProjectStatusStageRun),
+    ProjectStatusStageAttempt(ProjectStatusStageAttempt),
+    ProjectStatusStageResult(ProjectStatusStageResult),
     Scratch(Scratch),
     DeletedWorkspace {
         rowid: i64,

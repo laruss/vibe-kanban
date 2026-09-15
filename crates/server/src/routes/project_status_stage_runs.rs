@@ -11,6 +11,10 @@ use db::models::{
     coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessRunReason},
     project_status_automation::{AutomationSessionMode, ProjectStatusAutomation},
+    project_status_stage_result::{
+        ProjectStatusStageAttempt, ProjectStatusStageAttemptResponse, ProjectStatusStageResult,
+        ProjectStatusStageResultResponse, StageResultOutcome, StageResultRepositoryInput,
+    },
     project_status_stage_run::{
         IssueAutomationState, IssueStatusObservation, ProjectStatusEntry, ProjectStatusStageRun,
         ProjectStatusStageRunResponse, StageRunError, StageRunTrigger,
@@ -62,6 +66,7 @@ pub struct ObserveIssueStatusesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct StartProjectStatusStageRequest {
     pub workspace_id: Option<Uuid>,
+    pub input_result_id: Option<Uuid>,
 }
 
 #[derive(Debug)]
@@ -142,7 +147,7 @@ async fn observe_issue_statuses(
     for stage_run_id in starts {
         let deployment = deployment.clone();
         tokio::spawn(async move {
-            if let Err(error) = start_stage_run(&deployment, stage_run_id, None).await {
+            if let Err(error) = start_stage_run(&deployment, stage_run_id, None, None).await {
                 tracing::error!(%stage_run_id, %error, "Failed to start on-enter stage run");
             }
         });
@@ -223,7 +228,13 @@ async fn start_issue_stage(
         .msg_store()
         .push_patch(project_status_stage_run_patch::add(&stage_run));
 
-    let stage_run = start_stage_run(&deployment, stage_run.id, request.workspace_id).await?;
+    let stage_run = start_stage_run(
+        &deployment,
+        stage_run.id,
+        request.workspace_id,
+        request.input_result_id,
+    )
+    .await?;
     Ok(ResponseJson(ApiResponse::success(
         stage_run_response(&deployment, stage_run).await?,
     )))
@@ -233,6 +244,7 @@ async fn start_stage_run(
     deployment: &DeploymentImpl,
     stage_run_id: Uuid,
     requested_workspace_id: Option<Uuid>,
+    requested_input_result_id: Option<Uuid>,
 ) -> Result<ProjectStatusStageRun, ApiError> {
     let stage_run =
         match ProjectStatusStageRun::claim_start(&deployment.db().pool, stage_run_id).await {
@@ -245,8 +257,19 @@ async fn start_stage_run(
             Err(error) => return Err(stage_run_error_to_api(error)),
         };
 
-    if let Err(failure) =
-        start_claimed_stage_run(deployment, &stage_run, requested_workspace_id).await
+    let attempt =
+        ProjectStatusStageAttempt::latest_for_stage_run(&deployment.db().pool, stage_run_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Stage attempt was not created".to_string()))?;
+
+    if let Err(failure) = start_claimed_stage_run(
+        deployment,
+        &stage_run,
+        &attempt,
+        requested_workspace_id,
+        requested_input_result_id,
+    )
+    .await
     {
         tracing::warn!(
             %stage_run_id,
@@ -261,6 +284,13 @@ async fn start_stage_run(
             &failure.message,
         )
         .await?;
+        let repositories = start_failure_repository_inputs(deployment, attempt.id).await?;
+        ProjectStatusStageResult::materialize_for_attempt(
+            &deployment.db().pool,
+            attempt.id,
+            &repositories,
+        )
+        .await?;
     }
 
     ProjectStatusStageRun::find_by_id(&deployment.db().pool, stage_run_id)
@@ -271,7 +301,9 @@ async fn start_stage_run(
 async fn start_claimed_stage_run(
     deployment: &DeploymentImpl,
     stage_run: &ProjectStatusStageRun,
+    attempt: &ProjectStatusStageAttempt,
     requested_workspace_id: Option<Uuid>,
+    requested_input_result_id: Option<Uuid>,
 ) -> Result<(), StageStartFailure> {
     let entry = ProjectStatusEntry::find_by_id(&deployment.db().pool, stage_run.status_entry_id)
         .await
@@ -330,12 +362,57 @@ async fn start_claimed_stage_run(
         ));
     }
 
+    let explicit_handoff = if let Some(result_id) = requested_input_result_id {
+        let result = ProjectStatusStageResult::find_by_id(&deployment.db().pool, result_id)
+            .await
+            .map_err(database_start_failure)?
+            .ok_or_else(|| {
+                StageStartFailure::new("input_result_not_found", "Selected result was not found")
+            })?;
+        if result.remote_project_id != stage_run.remote_project_id
+            || result.issue_id != stage_run.issue_id
+        {
+            return Err(StageStartFailure::new(
+                "input_result_mismatch",
+                "Selected result belongs to another task",
+            ));
+        }
+        if result.outcome != StageResultOutcome::Completed {
+            return Err(StageStartFailure::new(
+                "input_result_not_successful",
+                "Only a successful result can be used as handoff input",
+            ));
+        }
+        Some(result)
+    } else {
+        None
+    };
+
+    let handoff_workspace_id = match explicit_handoff.as_ref() {
+        Some(result) => Some(result.workspace_id.ok_or_else(|| {
+            StageStartFailure::new(
+                "input_result_workspace_missing",
+                "Selected result has no workspace to continue",
+            )
+        })?),
+        None => None,
+    };
+    if let (Some(requested), Some(handoff_workspace)) =
+        (requested_workspace_id, handoff_workspace_id)
+        && requested != handoff_workspace
+    {
+        return Err(StageStartFailure::new(
+            "input_result_workspace_mismatch",
+            "Selected result was produced in a different workspace",
+        ));
+    }
+
     let (workspace, is_new) = resolve_workspace(
         deployment,
         &client,
         stage_run,
         &entry,
-        requested_workspace_id,
+        requested_workspace_id.or(handoff_workspace_id),
     )
     .await?;
 
@@ -355,6 +432,34 @@ async fn start_claimed_stage_run(
     ProjectStatusStageRun::assign_workspace(&deployment.db().pool, stage_run.id, workspace.id)
         .await
         .map_err(database_start_failure)?;
+
+    let handoff = match explicit_handoff {
+        Some(result) => Some(result),
+        None => ProjectStatusStageResult::latest_successful_for_issue_workspace(
+            &deployment.db().pool,
+            stage_run.remote_project_id,
+            stage_run.issue_id,
+            workspace.id,
+        )
+        .await
+        .map_err(database_start_failure)?,
+    };
+    ProjectStatusStageAttempt::set_input_result(
+        &deployment.db().pool,
+        attempt.id,
+        handoff.as_ref().map(|result| result.id),
+    )
+    .await
+    .map_err(database_start_failure)?;
+    let handoff = match handoff {
+        Some(result) => Some(
+            result
+                .response(&deployment.db().pool)
+                .await
+                .map_err(database_start_failure)?,
+        ),
+        None => None,
+    };
 
     let imported_attachments =
         match import_issue_attachments_from_remote(&client, deployment.file(), issue.id).await {
@@ -380,8 +485,11 @@ async fn start_claimed_stage_run(
             .map_err(database_start_failure)?;
     }
 
-    let task_prompt = build_stage_prompt(&issue, &stage_run.instructions);
+    let task_prompt = build_stage_prompt(&issue, &stage_run.instructions, handoff.as_ref());
     let prompt = rewrite_imported_issue_attachments_markdown(&task_prompt, &imported_attachments);
+    ProjectStatusStageAttempt::set_rendered_prompt(&deployment.db().pool, attempt.id, &prompt)
+        .await
+        .map_err(database_start_failure)?;
     let executor_config = ExecutorConfig::from(stage_run.executor_profile_id.clone());
 
     let start_result = if is_new {
@@ -414,11 +522,19 @@ async fn resolve_workspace(
     )
     .await
     .map_err(database_start_failure)?;
+    let successful_workspace_id = ProjectStatusStageResult::latest_successful_workspace_for_issue(
+        &deployment.db().pool,
+        stage_run.remote_project_id,
+        stage_run.issue_id,
+    )
+    .await
+    .map_err(database_start_failure)?;
 
     let candidates = [
         requested_workspace_id,
         stage_run.workspace_id,
         entry.preferred_workspace_id,
+        successful_workspace_id,
         previous_workspace_id,
     ];
     let mut seen = HashSet::new();
@@ -661,7 +777,11 @@ async fn compatible_previous_session(
     Ok(Some((session, info.session_id)))
 }
 
-fn build_stage_prompt(issue: &Issue, instructions: &str) -> String {
+fn build_stage_prompt(
+    issue: &Issue,
+    instructions: &str,
+    handoff: Option<&ProjectStatusStageResultResponse>,
+) -> String {
     let description = issue
         .description
         .as_deref()
@@ -671,9 +791,82 @@ fn build_stage_prompt(issue: &Issue, instructions: &str) -> String {
     } else {
         instructions.trim()
     };
+    let (previous_result, repository_state) = match handoff {
+        Some(handoff) => {
+            let summary = handoff
+                .result
+                .summary
+                .as_deref()
+                .unwrap_or("No agent summary was captured for this result.");
+            let executions = if handoff.execution_process_ids.is_empty() {
+                "none".to_string()
+            } else {
+                handoff
+                    .execution_process_ids
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let previous_result = format!(
+                "Result ID: {}\nStage run ID: {}\nAttempt ID: {}\nStatus ID: {}\nConfiguration revision: {}\nExecutor profile: {}\nOutcome: completed\nWorkspace ID: {}\nSession ID: {}\nCompleted at: {}\nExecution IDs: {}\n\n{}",
+                handoff.result.id,
+                handoff.result.stage_run_id,
+                handoff.result.attempt_id,
+                handoff.result.project_status_id,
+                handoff.result.automation_revision,
+                handoff.result.executor_profile_id,
+                handoff
+                    .result
+                    .workspace_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                handoff
+                    .result
+                    .session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                handoff.result.completed_at,
+                executions,
+                summary,
+            );
+            let repository_state = if handoff.repositories.is_empty() {
+                "No repository snapshot was captured. Inspect the current workspace state."
+                    .to_string()
+            } else {
+                handoff
+                    .repositories
+                    .iter()
+                    .map(|repository| {
+                        let dirty = match repository.has_uncommitted_changes {
+                            Some(true) => "dirty",
+                            Some(false) => "clean",
+                            None => "unknown",
+                        };
+                        format!(
+                            "- {}: base={}, result={}, worktree={}",
+                            repository.repo_name,
+                            repository.base_head_commit.as_deref().unwrap_or("unknown"),
+                            repository
+                                .resulting_head_commit
+                                .as_deref()
+                                .unwrap_or("unknown"),
+                            dirty,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            (previous_result, repository_state)
+        }
+        None => (
+            "No successful previous-stage result was selected.".to_string(),
+            "Inspect the linked workspace and its repositories before making changes.".to_string(),
+        ),
+    };
     format!(
-        "# Original task\n\n{}: {}\n\n{}\n\n# Current stage instructions\n\n{}\n\n# Handoff context\n\nContinue in the linked task workspace and inspect its existing files and commits before making changes.",
-        issue.simple_id, issue.title, description, instructions
+        "# Original task\n\n{}: {}\n\n{}\n\n# Current stage instructions\n\n{}\n\n# Previous stage result\n\n{}\n\n# Repository state\n\n{}",
+        issue.simple_id, issue.title, description, instructions, previous_result, repository_state,
     )
 }
 
@@ -724,9 +917,30 @@ async fn stage_run_response(
 ) -> Result<ProjectStatusStageRunResponse, ApiError> {
     let execution_process_ids =
         ProjectStatusStageRun::execution_process_ids(&deployment.db().pool, stage_run.id).await?;
+    let attempt_models =
+        ProjectStatusStageAttempt::list_by_stage_run(&deployment.db().pool, stage_run.id).await?;
+    let mut attempts = Vec::with_capacity(attempt_models.len());
+    for attempt in attempt_models {
+        let execution_process_ids =
+            ProjectStatusStageAttempt::execution_process_ids(&deployment.db().pool, attempt.id)
+                .await?;
+        let result =
+            match ProjectStatusStageResult::find_by_attempt(&deployment.db().pool, attempt.id)
+                .await?
+            {
+                Some(result) => Some(result.response(&deployment.db().pool).await?),
+                None => None,
+            };
+        attempts.push(ProjectStatusStageAttemptResponse {
+            attempt,
+            execution_process_ids,
+            result,
+        });
+    }
     Ok(ProjectStatusStageRunResponse {
         stage_run,
         execution_process_ids,
+        attempts,
     })
 }
 
@@ -739,4 +953,153 @@ fn stage_run_error_to_api(error: StageRunError) -> ApiError {
 
 fn database_start_failure(error: sqlx::Error) -> StageStartFailure {
     StageStartFailure::new("database_error", error.to_string())
+}
+
+async fn start_failure_repository_inputs(
+    deployment: &DeploymentImpl,
+    attempt_id: Uuid,
+) -> Result<Vec<StageResultRepositoryInput>, sqlx::Error> {
+    let Some(attempt) =
+        ProjectStatusStageAttempt::find_by_id(&deployment.db().pool, attempt_id).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(workspace_id) = attempt.workspace_id else {
+        return Ok(Vec::new());
+    };
+    let Some(workspace) = Workspace::find_by_id(&deployment.db().pool, workspace_id).await? else {
+        return Ok(Vec::new());
+    };
+    let Some(workspace_root) = workspace.container_ref.as_deref().map(std::path::PathBuf::from)
+    else {
+        return Ok(Vec::new());
+    };
+    let repos = WorkspaceRepo::find_repos_for_workspace(&deployment.db().pool, workspace_id).await?;
+    let mut repositories =
+        ProjectStatusStageAttempt::repository_inputs(&deployment.db().pool, attempt_id, &repos)
+            .await?;
+
+    for repo in repos {
+        let Some(repository) = repositories
+            .iter_mut()
+            .find(|repository| repository.repo_id == repo.id)
+        else {
+            continue;
+        };
+        let repo_path = workspace_root.join(repo.name);
+        if let Ok(head) = deployment.git().get_head_info(&repo_path) {
+            if repository.base_head_commit.is_none() {
+                repository.base_head_commit = Some(head.oid.clone());
+            }
+            repository.resulting_head_commit = Some(head.oid);
+        }
+        if let Ok((uncommitted, untracked)) =
+            deployment.git().get_worktree_change_counts(&repo_path)
+        {
+            repository.uncommitted_changes_count = i64::try_from(uncommitted).ok();
+            repository.untracked_files_count = i64::try_from(untracked).ok();
+        }
+    }
+    Ok(repositories)
+}
+
+#[cfg(test)]
+mod tests {
+    use api_types::Issue;
+    use chrono::Utc;
+    use db::models::project_status_stage_result::{
+        ProjectStatusStageResult, ProjectStatusStageResultRepository,
+        ProjectStatusStageResultResponse, StageResultOutcome,
+    };
+    use executors::{executors::BaseCodingAgent, profile::ExecutorProfileId};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::build_stage_prompt;
+
+    fn issue() -> Issue {
+        let now = Utc::now();
+        Issue {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            issue_number: 6,
+            simple_id: "VK-6".to_string(),
+            status_id: Uuid::new_v4(),
+            title: "Pass durable context".to_string(),
+            description: Some("Keep authored and generated context separate.".to_string()),
+            priority: None,
+            start_date: None,
+            target_date: None,
+            completed_at: None,
+            sort_order: 0.0,
+            parent_issue_id: None,
+            parent_issue_sort_order: None,
+            extension_metadata: json!({}),
+            creator_user_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn prompt_keeps_authored_instructions_and_generated_handoff_separate() {
+        let now = Utc::now();
+        let result_id = Uuid::new_v4();
+        let stage_run_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let execution_id = Uuid::new_v4();
+        let handoff = ProjectStatusStageResultResponse {
+            result: ProjectStatusStageResult {
+                id: result_id,
+                attempt_id,
+                stage_run_id,
+                status_entry_id: Uuid::new_v4(),
+                remote_project_id: Uuid::new_v4(),
+                issue_id: Uuid::new_v4(),
+                project_status_id: Uuid::new_v4(),
+                automation_revision: 3,
+                executor_profile_id: ExecutorProfileId::new(BaseCodingAgent::Codex),
+                outcome: StageResultOutcome::Completed,
+                summary: None,
+                error_code: None,
+                error_message: None,
+                workspace_id: Some(Uuid::new_v4()),
+                session_id: Some(Uuid::new_v4()),
+                completed_at: now,
+                created_at: now,
+            },
+            execution_process_ids: vec![execution_id],
+            repositories: vec![ProjectStatusStageResultRepository {
+                result_id,
+                repo_id: Uuid::new_v4(),
+                repo_name: "vibe-kanban".to_string(),
+                base_head_commit: Some("base-sha".to_string()),
+                resulting_head_commit: Some("result-sha".to_string()),
+                has_uncommitted_changes: Some(false),
+                uncommitted_changes_count: Some(0),
+                untracked_files_count: Some(0),
+                created_at: now,
+            }],
+        };
+
+        let prompt = build_stage_prompt(&issue(), "Review the implementation.", Some(&handoff));
+
+        assert!(prompt.contains("# Original task\n\nVK-6: Pass durable context"));
+        assert!(prompt.contains("# Current stage instructions\n\nReview the implementation."));
+        assert!(prompt.contains(&format!(
+            "# Previous stage result\n\nResult ID: {result_id}"
+        )));
+        assert!(prompt.contains("No agent summary was captured for this result."));
+        assert!(prompt.contains(&execution_id.to_string()));
+        assert!(prompt.contains(
+            "# Repository state\n\n- vibe-kanban: base=base-sha, result=result-sha, worktree=clean"
+        ));
+    }
+
+    #[test]
+    fn prompt_without_handoff_is_explicit() {
+        let prompt = build_stage_prompt(&issue(), "", None);
+        assert!(prompt.contains("Complete the task for this Kanban stage."));
+        assert!(prompt.contains("No successful previous-stage result was selected."));
+    }
 }

@@ -13,6 +13,7 @@ use super::{
     project_status_automation::{
         AutomationSessionMode, AutomationStartMode, ProjectStatusAutomation,
     },
+    project_status_stage_result::{ProjectStatusStageAttemptResponse, STAGE_PROMPT_SCHEMA_VERSION},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -82,6 +83,7 @@ pub struct ProjectStatusStageRun {
     pub remote_project_id: Uuid,
     pub issue_id: Uuid,
     pub project_status_id: Uuid,
+    pub automation_revision: i64,
     pub trigger: StageRunTrigger,
     pub status: StageRunStatus,
     pub executor_profile_id: ExecutorProfileId,
@@ -101,6 +103,7 @@ pub struct ProjectStatusStageRun {
 pub struct ProjectStatusStageRunResponse {
     pub stage_run: ProjectStatusStageRun,
     pub execution_process_ids: Vec<Uuid>,
+    pub attempts: Vec<ProjectStatusStageAttemptResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -162,6 +165,7 @@ struct ProjectStatusStageRunRow {
     remote_project_id: Uuid,
     issue_id: Uuid,
     project_status_id: Uuid,
+    automation_revision: i64,
     trigger: String,
     status: String,
     executor: String,
@@ -560,9 +564,9 @@ impl ProjectStatusStageRun {
         sqlx::query(
             r#"INSERT INTO project_status_stage_runs (
                     id, status_entry_id, remote_project_id, issue_id,
-                    project_status_id, trigger, status, executor,
+                    project_status_id, automation_revision, trigger, status, executor,
                     executor_variant, instructions, session_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                 ON CONFLICT(status_entry_id) DO NOTHING"#,
         )
         .bind(id)
@@ -570,6 +574,7 @@ impl ProjectStatusStageRun {
         .bind(entry.remote_project_id)
         .bind(entry.issue_id)
         .bind(entry.project_status_id)
+        .bind(automation.revision)
         .bind(trigger.as_str())
         .bind(automation.executor_profile_id.executor.to_string())
         .bind(&automation.executor_profile_id.variant)
@@ -612,7 +617,7 @@ impl ProjectStatusStageRun {
     fn select_sql(predicate: &str) -> String {
         format!(
             r#"SELECT id, status_entry_id, remote_project_id, issue_id,
-                      project_status_id, trigger, status, executor,
+                      project_status_id, automation_revision, trigger, status, executor,
                       executor_variant, instructions, session_mode, workspace_id,
                       session_id, error_code, error_message, started_at,
                       completed_at, created_at, updated_at
@@ -653,6 +658,7 @@ impl ProjectStatusStageRun {
     }
 
     pub async fn claim_start(pool: &SqlitePool, id: Uuid) -> Result<Self, StageRunError> {
+        let mut transaction = pool.begin().await?;
         let result = sqlx::query(
             r#"UPDATE project_status_stage_runs
                SET status = 'starting', error_code = NULL, error_message = NULL,
@@ -662,15 +668,43 @@ impl ProjectStatusStageRun {
                WHERE id = ? AND status IN ('pending', 'start_failed')"#,
         )
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        if result.rows_affected() == 0 {
+            transaction.commit().await?;
+            let stage_run = Self::find_by_id(pool, id)
+                .await?
+                .ok_or(StageRunError::StageRunNotFound)?;
+            return Err(StageRunError::CannotStart(stage_run.status));
+        }
+
+        let attempt_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO project_status_stage_attempts (
+                    id, stage_run_id, attempt_number, status, executor,
+                    executor_variant, automation_revision, prompt_schema_version
+                )
+                SELECT ?, sr.id,
+                       COALESCE((
+                           SELECT MAX(attempt_number)
+                           FROM project_status_stage_attempts
+                           WHERE stage_run_id = sr.id
+                       ), 0) + 1,
+                       'starting', sr.executor, sr.executor_variant,
+                       sr.automation_revision, ?
+                FROM project_status_stage_runs sr
+                WHERE sr.id = ?"#,
+        )
+        .bind(attempt_id)
+        .bind(STAGE_PROMPT_SCHEMA_VERSION)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
 
         let stage_run = Self::find_by_id(pool, id)
             .await?
             .ok_or(StageRunError::StageRunNotFound)?;
-        if result.rows_affected() == 0 {
-            return Err(StageRunError::CannotStart(stage_run.status));
-        }
         Ok(stage_run)
     }
 
@@ -679,6 +713,7 @@ impl ProjectStatusStageRun {
         id: Uuid,
         workspace_id: Uuid,
     ) -> Result<(), sqlx::Error> {
+        let mut transaction = pool.begin().await?;
         sqlx::query(
             r#"UPDATE project_status_stage_runs
                SET workspace_id = ?, updated_at = datetime('now', 'subsec')
@@ -686,8 +721,21 @@ impl ProjectStatusStageRun {
         )
         .bind(workspace_id)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET workspace_id = ?, updated_at = datetime('now', 'subsec')
+               WHERE id = (
+                   SELECT id FROM project_status_stage_attempts
+                   WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
+               )"#,
+        )
+        .bind(workspace_id)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -699,6 +747,17 @@ impl ProjectStatusStageRun {
         workspace_id: Uuid,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<(), sqlx::Error> {
+        let mut transaction = pool.begin().await?;
+        let attempt_id = sqlx::query_scalar::<_, Uuid>(
+            r#"SELECT id FROM project_status_stage_attempts
+               WHERE stage_run_id = ? AND status IN ('starting', 'running')
+               ORDER BY attempt_number DESC LIMIT 1"#,
+        )
+        .bind(stage_run_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+
         sqlx::query(
             r#"INSERT INTO project_status_stage_run_executions (
                     stage_run_id, execution_process_id
@@ -707,7 +766,26 @@ impl ProjectStatusStageRun {
         )
         .bind(stage_run_id)
         .bind(execution_process_id)
-        .execute(pool)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO project_status_stage_attempt_executions (
+                    attempt_id, execution_process_id, sequence
+                ) VALUES (
+                    ?, ?,
+                    COALESCE((
+                        SELECT MAX(sequence)
+                        FROM project_status_stage_attempt_executions
+                        WHERE attempt_id = ?
+                    ), 0) + 1
+                )
+                ON CONFLICT(attempt_id, execution_process_id) DO NOTHING"#,
+        )
+        .bind(attempt_id)
+        .bind(execution_process_id)
+        .bind(attempt_id)
+        .execute(&mut *transaction)
         .await?;
 
         let status = match run_reason {
@@ -724,8 +802,21 @@ impl ProjectStatusStageRun {
         .bind(session_id)
         .bind(status)
         .bind(stage_run_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET workspace_id = ?, session_id = ?, status = ?,
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ?"#,
+        )
+        .bind(workspace_id)
+        .bind(session_id)
+        .bind(status)
+        .bind(attempt_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -735,6 +826,7 @@ impl ProjectStatusStageRun {
         code: &str,
         message: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut transaction = pool.begin().await?;
         sqlx::query(
             r#"UPDATE project_status_stage_runs
                SET status = 'start_failed', error_code = ?, error_message = ?,
@@ -745,8 +837,24 @@ impl ProjectStatusStageRun {
         .bind(code)
         .bind(message)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET status = 'start_failed', error_code = ?, error_message = ?,
+                   completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = (
+                   SELECT id FROM project_status_stage_attempts
+                   WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
+               )"#,
+        )
+        .bind(code)
+        .bind(message)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -755,6 +863,7 @@ impl ProjectStatusStageRun {
         execution_process_id: Uuid,
         message: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut transaction = pool.begin().await?;
         sqlx::query(
             r#"UPDATE project_status_stage_runs
                SET status = 'start_failed', error_code = 'next_action_start_failed',
@@ -768,8 +877,23 @@ impl ProjectStatusStageRun {
         )
         .bind(message)
         .bind(execution_process_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET status = 'start_failed', error_code = 'next_action_start_failed',
+                   error_message = ?, completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = (
+                   SELECT attempt_id FROM project_status_stage_attempt_executions
+                   WHERE execution_process_id = ?
+               )"#,
+        )
+        .bind(message)
+        .bind(execution_process_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -784,6 +908,7 @@ impl ProjectStatusStageRun {
             ExecutionProcessStatus::Killed => "killed",
             ExecutionProcessStatus::Running => return Ok(()),
         };
+        let mut transaction = pool.begin().await?;
         sqlx::query(
             r#"UPDATE project_status_stage_runs
                SET status = ?, completed_at = datetime('now', 'subsec'),
@@ -796,8 +921,22 @@ impl ProjectStatusStageRun {
         )
         .bind(status)
         .bind(execution_process_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET status = ?, completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = (
+                   SELECT attempt_id FROM project_status_stage_attempt_executions
+                   WHERE execution_process_id = ?
+               )"#,
+        )
+        .bind(status)
+        .bind(execution_process_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -920,6 +1059,7 @@ impl TryFrom<ProjectStatusStageRunRow> for ProjectStatusStageRun {
             remote_project_id: row.remote_project_id,
             issue_id: row.issue_id,
             project_status_id: row.project_status_id,
+            automation_revision: row.automation_revision,
             trigger: parse_trigger(&row.trigger)?,
             status: parse_status(&row.status)?,
             executor_profile_id: ExecutorProfileId {
@@ -1006,6 +1146,7 @@ mod tests {
         StageRunStatus,
     };
     use crate::models::{
+        coding_agent_turn::{CodingAgentTurn, CreateCodingAgentTurn},
         execution_process::{
             CreateExecutionProcess, ExecutionProcess, ExecutionProcessRunReason,
             ExecutionProcessStatus,
@@ -1013,6 +1154,10 @@ mod tests {
         project_status_automation::{
             AutomationCompletionMode, AutomationSessionMode, AutomationStartMode,
             ProjectStatusAutomation,
+        },
+        project_status_stage_result::{
+            ProjectStatusStageAttempt, ProjectStatusStageResult, StageResultOutcome,
+            StageResultRepositoryInput,
         },
         session::{CreateSession, Session},
         workspace::{CreateWorkspace, Workspace},
@@ -1036,6 +1181,7 @@ mod tests {
         ProjectStatusAutomation {
             remote_project_id,
             project_status_id,
+            revision: 1,
             enabled: true,
             executor_profile_id: ExecutorProfileId::new(BaseCodingAgent::Codex),
             instructions: "Implement this stage".to_string(),
@@ -1246,6 +1392,11 @@ mod tests {
             ProjectStatusStageRun::claim_start(&pool, stage_run.id).await,
             Err(StageRunError::CannotStart(StageRunStatus::Starting))
         ));
+        let attempts = ProjectStatusStageAttempt::list_by_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_number, 1);
     }
 
     #[tokio::test]
@@ -1301,6 +1452,9 @@ mod tests {
         .await
         .unwrap();
         let stage_run = outcome.stage_run.unwrap();
+        ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
 
         let workspace = Workspace::create(
             &pool,
@@ -1343,6 +1497,19 @@ mod tests {
         )
         .await
         .unwrap();
+        CodingAgentTurn::create(
+            &pool,
+            &CreateCodingAgentTurn {
+                execution_process_id: execution.id,
+                prompt: Some("structured prompt".to_string()),
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        CodingAgentTurn::update_summary(&pool, execution.id, "Stage completed")
+            .await
+            .unwrap();
 
         ProjectStatusStageRun::attach_execution(
             &pool,
@@ -1384,6 +1551,265 @@ mod tests {
                 .status,
             StageRunStatus::Completed
         );
+
+        let attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, StageRunStatus::Completed);
+        assert_eq!(
+            ProjectStatusStageAttempt::execution_process_ids(&pool, attempt.id)
+                .await
+                .unwrap(),
+            vec![execution.id]
+        );
+        let repo_id = uuid::Uuid::new_v4();
+        let result = ProjectStatusStageResult::materialize_for_attempt(
+            &pool,
+            attempt.id,
+            &[StageResultRepositoryInput {
+                repo_id,
+                repo_name: "app".to_string(),
+                base_head_commit: Some("base".to_string()),
+                resulting_head_commit: Some("result".to_string()),
+                uncommitted_changes_count: Some(0),
+                untracked_files_count: Some(0),
+            }],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.outcome, StageResultOutcome::Completed);
+        assert_eq!(result.summary.as_deref(), Some("Stage completed"));
+        let response = result.clone().response(&pool).await.unwrap();
+        assert_eq!(response.execution_process_ids, vec![execution.id]);
+        assert_eq!(response.repositories.len(), 1);
+        assert_eq!(
+            response.repositories[0].base_head_commit.as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            response.repositories[0].resulting_head_commit.as_deref(),
+            Some("result")
+        );
+        assert_eq!(
+            response.repositories[0].has_uncommitted_changes,
+            Some(false)
+        );
+
+        let duplicate = ProjectStatusStageResult::materialize_for_attempt(
+            &pool,
+            attempt.id,
+            &[StageResultRepositoryInput {
+                repo_id,
+                repo_name: "changed".to_string(),
+                base_head_commit: None,
+                resulting_head_commit: None,
+                uncommitted_changes_count: Some(1),
+                untracked_files_count: Some(0),
+            }],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(duplicate.id, result.id);
+        assert_eq!(
+            ProjectStatusStageResult::repositories(&pool, result.id)
+                .await
+                .unwrap()[0]
+                .repo_name,
+            "app"
+        );
+        assert!(
+            sqlx::query("UPDATE project_status_stage_results SET summary = 'changed' WHERE id = ?")
+                .bind(result.id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE project_status_stage_result_repositories SET repo_name = 'changed' \
+                 WHERE result_id = ? AND repo_id = ?",
+            )
+            .bind(result.id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_failure_retry_keeps_immutable_attempt_result() {
+        let pool = migrated_pool().await;
+        let project_id = uuid::Uuid::new_v4();
+        let issue_id = uuid::Uuid::new_v4();
+        let status_id = uuid::Uuid::new_v4();
+        let automation = automation(project_id, status_id, AutomationStartMode::Manual);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, status_id, Utc::now()),
+            Some(&automation),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+
+        ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
+        let first = ProjectStatusStageAttempt::latest_for_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectStatusStageRun::mark_start_failed(
+            &pool,
+            stage_run.id,
+            "workspace_missing",
+            "Workspace unavailable",
+        )
+        .await
+        .unwrap();
+        let first_result = ProjectStatusStageResult::materialize_for_attempt(&pool, first.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+
+        ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
+        let attempts = ProjectStatusStageAttempt::list_by_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[1].attempt_number, 2);
+        assert_eq!(first_result.outcome, StageResultOutcome::StartFailed);
+        assert_eq!(
+            first_result.error_code.as_deref(),
+            Some("workspace_missing")
+        );
+        assert_eq!(
+            ProjectStatusStageResult::find_by_attempt(&pool, first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first_result.id
+        );
+    }
+
+    #[tokio::test]
+    async fn default_handoff_uses_latest_successful_result_in_workspace() {
+        let pool = migrated_pool().await;
+        let project_id = uuid::Uuid::new_v4();
+        let issue_id = uuid::Uuid::new_v4();
+        let status_id = uuid::Uuid::new_v4();
+        let other_status_id = uuid::Uuid::new_v4();
+        let workspace_id = uuid::Uuid::new_v4();
+        let automation = automation(project_id, status_id, AutomationStartMode::Manual);
+        let now = Utc::now();
+
+        let first_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, status_id, now),
+            Some(&automation),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        ProjectStatusStageRun::claim_start(&pool, first_run.id)
+            .await
+            .unwrap();
+        ProjectStatusStageRun::assign_workspace(&pool, first_run.id, workspace_id)
+            .await
+            .unwrap();
+        let first_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, first_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET status = 'completed', completed_at = datetime('now', 'subsec')
+               WHERE id = ?"#,
+        )
+        .bind(first_attempt.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let successful =
+            ProjectStatusStageResult::materialize_for_attempt(&pool, first_attempt.id, &[])
+                .await
+                .unwrap()
+                .unwrap();
+
+        ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, other_status_id, now + Duration::milliseconds(1)),
+            None,
+        )
+        .await
+        .unwrap();
+        let failed_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, status_id, now + Duration::milliseconds(2)),
+            Some(&automation),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        ProjectStatusStageRun::claim_start(&pool, failed_run.id)
+            .await
+            .unwrap();
+        ProjectStatusStageRun::assign_workspace(&pool, failed_run.id, workspace_id)
+            .await
+            .unwrap();
+        let failed_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, failed_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectStatusStageAttempt::set_input_result(&pool, failed_attempt.id, Some(successful.id))
+            .await
+            .unwrap();
+        ProjectStatusStageRun::mark_start_failed(
+            &pool,
+            failed_run.id,
+            "executor_unavailable",
+            "Executor unavailable",
+        )
+        .await
+        .unwrap();
+        ProjectStatusStageResult::materialize_for_attempt(&pool, failed_attempt.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+
+        let selected = ProjectStatusStageResult::latest_successful_for_issue_workspace(
+            &pool,
+            project_id,
+            issue_id,
+            workspace_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.id, successful.id);
+        assert_eq!(
+            ProjectStatusStageAttempt::find_by_id(&pool, failed_attempt.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .input_result_id,
+            Some(successful.id)
+        );
     }
 
     #[tokio::test]
@@ -1412,6 +1838,12 @@ mod tests {
         .unwrap()
         .stage_run
         .unwrap();
+        ProjectStatusStageRun::claim_start(&pool, first.id)
+            .await
+            .unwrap();
+        ProjectStatusStageRun::claim_start(&pool, second.id)
+            .await
+            .unwrap();
 
         let workspace = Workspace::create(
             &pool,

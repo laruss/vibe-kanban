@@ -126,7 +126,15 @@ async fn update_project_status_automation(
         Err(ProjectStatusAutomationUpsertError::Database(error)) => return Err(error.into()),
     }
 
-    Ok(ResponseJson(ApiResponse::success(response)))
+    let persisted =
+        ProjectStatusAutomation::find(&deployment.db().pool, remote_project_id, project_status_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Saved automation was not found".to_string()))?;
+    Ok(ResponseJson(ApiResponse::success(automation_response(
+        persisted,
+        &profiles,
+        project_status_ids.as_ref(),
+    ))))
 }
 
 async fn delete_project_status_automation(

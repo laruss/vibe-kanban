@@ -1,5 +1,6 @@
 use db::models::{
     execution_process::ExecutionProcess,
+    project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
     project_status_stage_run::{ProjectStatusEntry, ProjectStatusStageRun},
     scratch::Scratch,
     workspace::WorkspaceWithStatus,
@@ -70,6 +71,54 @@ pub mod project_status_stage_run_patch {
                 .expect("Project status stage run path should be valid"),
             value: serde_json::to_value(stage_run)
                 .expect("Project status stage run serialization should not fail"),
+        })])
+    }
+}
+
+pub mod project_status_stage_attempt_patch {
+    use super::*;
+
+    fn attempt_path(attempt_id: Uuid) -> String {
+        format!(
+            "/project_status_stage_attempts/{}",
+            escape_pointer_segment(&attempt_id.to_string())
+        )
+    }
+
+    pub fn add(attempt: &ProjectStatusStageAttempt) -> Patch {
+        Patch(vec![PatchOperation::Add(AddOperation {
+            path: attempt_path(attempt.id)
+                .try_into()
+                .expect("Project status stage attempt path should be valid"),
+            value: serde_json::to_value(attempt)
+                .expect("Project status stage attempt serialization should not fail"),
+        })])
+    }
+
+    pub fn replace(attempt: &ProjectStatusStageAttempt) -> Patch {
+        Patch(vec![PatchOperation::Replace(ReplaceOperation {
+            path: attempt_path(attempt.id)
+                .try_into()
+                .expect("Project status stage attempt path should be valid"),
+            value: serde_json::to_value(attempt)
+                .expect("Project status stage attempt serialization should not fail"),
+        })])
+    }
+}
+
+pub mod project_status_stage_result_patch {
+    use super::*;
+
+    pub fn add(result: &ProjectStatusStageResult) -> Patch {
+        Patch(vec![PatchOperation::Add(AddOperation {
+            path: format!(
+                "/project_status_stage_results/{}",
+                escape_pointer_segment(&result.id.to_string())
+            )
+            .try_into()
+            .expect("Project status stage result path should be valid"),
+            value: serde_json::to_value(result)
+                .expect("Project status stage result serialization should not fail"),
         })])
     }
 }

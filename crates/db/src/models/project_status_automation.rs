@@ -16,6 +16,7 @@ pub const MAX_AUTOMATION_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 pub struct ProjectStatusAutomation {
     pub remote_project_id: Uuid,
     pub project_status_id: Uuid,
+    pub revision: i64,
     pub enabled: bool,
     pub executor_profile_id: ExecutorProfileId,
     pub instructions: String,
@@ -155,6 +156,7 @@ pub enum ProjectStatusAutomationUpsertError {
 struct ProjectStatusAutomationRow {
     remote_project_id: Uuid,
     project_status_id: Uuid,
+    revision: i64,
     enabled: bool,
     executor: String,
     executor_variant: Option<String>,
@@ -174,6 +176,7 @@ impl ProjectStatusAutomation {
         Self {
             remote_project_id,
             project_status_id,
+            revision: 1,
             enabled: update.enabled,
             executor_profile_id: update.executor_profile_id,
             instructions: update.instructions,
@@ -251,6 +254,7 @@ impl ProjectStatusAutomation {
         let row = sqlx::query_as::<_, ProjectStatusAutomationRow>(
             r#"SELECT remote_project_id,
                       project_status_id,
+                      revision,
                       enabled,
                       executor,
                       executor_variant,
@@ -277,6 +281,7 @@ impl ProjectStatusAutomation {
         let rows = sqlx::query_as::<_, ProjectStatusAutomationRow>(
             r#"SELECT remote_project_id,
                       project_status_id,
+                      revision,
                       enabled,
                       executor,
                       executor_variant,
@@ -315,6 +320,7 @@ impl ProjectStatusAutomation {
                     next_status_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_status_id) DO UPDATE SET
+                    revision = project_status_automations.revision + 1,
                     enabled = excluded.enabled,
                     executor = excluded.executor,
                     executor_variant = excluded.executor_variant,
@@ -411,6 +417,7 @@ impl TryFrom<ProjectStatusAutomationRow> for ProjectStatusAutomation {
         Ok(Self {
             remote_project_id: row.remote_project_id,
             project_status_id: row.project_status_id,
+            revision: row.revision,
             enabled: row.enabled,
             executor_profile_id: ExecutorProfileId {
                 executor: parse_executor(&row.executor)?,
@@ -818,6 +825,7 @@ mod tests {
 
         expected.instructions = "Updated instructions".to_string();
         expected.upsert(&pool).await.unwrap();
+        expected.revision = 2;
         assert_eq!(
             ProjectStatusAutomation::find(&pool, project_id, status_id)
                 .await

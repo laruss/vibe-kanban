@@ -17,6 +17,9 @@ use db::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
         execution_process_repo_state::ExecutionProcessRepoState,
+        project_status_stage_result::{
+            ProjectStatusStageAttempt, ProjectStatusStageResult,
+        },
         project_status_stage_run::ProjectStatusStageRun,
         repo::Repo,
         scratch::{DraftFollowUpData, Scratch, ScratchType},
@@ -338,7 +341,53 @@ impl LocalContainerService {
                     .await;
                 }
             }
+
+            if let Err(error) = self
+                .materialize_stage_result(exec_id, &ctx, &workspace_root)
+                .await
+            {
+                tracing::error!(
+                    execution_process_id = %exec_id,
+                    %error,
+                    "Failed to materialize project status stage result"
+                );
+            }
         }
+    }
+
+    async fn materialize_stage_result(
+        &self,
+        exec_id: Uuid,
+        ctx: &ExecutionContext,
+        workspace_root: &Path,
+    ) -> Result<(), ContainerError> {
+        let Some(attempt_id) =
+            ProjectStatusStageAttempt::id_for_execution(&self.db.pool, exec_id).await?
+        else {
+            return Ok(());
+        };
+        let mut repositories = ProjectStatusStageAttempt::repository_inputs(
+            &self.db.pool,
+            attempt_id,
+            &ctx.repos,
+        )
+        .await?;
+
+        for repo in &ctx.repos {
+            let repo_path = workspace_root.join(&repo.name);
+            if let Ok((uncommitted, untracked)) = self.git().get_worktree_change_counts(&repo_path)
+                && let Some(repository) = repositories
+                    .iter_mut()
+                    .find(|repository| repository.repo_id == repo.id)
+            {
+                repository.uncommitted_changes_count = i64::try_from(uncommitted).ok();
+                repository.untracked_files_count = i64::try_from(untracked).ok();
+            }
+        }
+
+        ProjectStatusStageResult::materialize_for_attempt(&self.db.pool, attempt_id, &repositories)
+            .await?;
+        Ok(())
     }
 
     /// Get the commit message based on the execution run reason.

@@ -53,6 +53,7 @@ import {
   replaceAttachmentSource,
 } from '@/shared/lib/attachmentUtils';
 import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
+import { IssueAutomationSectionContainer } from '@/features/project-automation/containers/IssueAutomationSectionContainer';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { useCurrentKanbanRouteState } from '@/shared/hooks/useCurrentKanbanRouteState';
 import {
@@ -1083,6 +1084,18 @@ export function KanbanIssuePanelContainer({
       titleInputRef={titleInputRef}
       onDeleteDraft={
         mode === 'create' && isCreateDraftDirty ? handleDeleteDraft : undefined
+      }
+      renderAutomationSection={
+        mode === 'edit'
+          ? (issueId) => (
+              <IssueAutomationSectionContainer
+                issueId={issueId}
+                currentStatusId={
+                  selectedIssue?.status_id ?? displayData.statusId
+                }
+              />
+            )
+          : undefined
       }
       onCopyLink={mode === 'edit' ? handleCopyLink : undefined}
       onMoreActions={mode === 'edit' ? handleMoreActions : undefined}

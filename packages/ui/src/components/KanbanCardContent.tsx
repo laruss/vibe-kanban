@@ -7,6 +7,7 @@ import {
   CircleDashedIcon,
   DotsThreeIcon,
   PlusIcon,
+  RobotIcon,
 } from '@phosphor-icons/react';
 import { cn } from '../lib/cn';
 import { PriorityIcon, type PriorityLevel } from './PriorityIcon';
@@ -36,6 +37,20 @@ export interface KanbanPullRequest {
   number: number;
   url: string;
   status: PrBadgeStatus;
+}
+
+export interface KanbanAutomationBadge {
+  agentLabel: string;
+  status:
+    | 'ready'
+    | 'pending'
+    | 'starting'
+    | 'running'
+    | 'completed'
+    | 'failed'
+    | 'killed'
+    | 'start_failed'
+    | 'paused';
 }
 
 export interface TagEditRenderProps<TTag extends KanbanTag = KanbanTag> {
@@ -130,6 +145,7 @@ export type KanbanCardContentProps<TTag extends KanbanTag = KanbanTag> = {
   assignees: KanbanAssigneeUser[];
   pullRequests?: KanbanPullRequest[];
   relationships?: KanbanRelationship[];
+  automation?: KanbanAutomationBadge | null;
   isSubIssue?: boolean;
   isLoading?: boolean;
   className?: string;
@@ -149,6 +165,7 @@ export function KanbanCardContent<TTag extends KanbanTag = KanbanTag>({
   assignees,
   pullRequests = [],
   relationships = [],
+  automation,
   isSubIssue,
   isLoading = false,
   className,
@@ -198,6 +215,32 @@ export function KanbanCardContent<TTag extends KanbanTag = KanbanTag>({
       {tagsDisplay}
     </button>
   );
+  const automationStatusLabel = automation
+    ? {
+        ready: 'Ready',
+        pending: 'Pending',
+        starting: 'Starting',
+        running: 'Running',
+        completed: 'Completed',
+        failed: 'Failed',
+        killed: 'Stopped',
+        start_failed: 'Start failed',
+        paused: 'Paused',
+      }[automation.status]
+    : null;
+  const automationStatusClass = automation
+    ? {
+        ready: 'text-low bg-panel',
+        pending: 'text-low bg-panel',
+        starting: 'text-brand bg-brand/10',
+        running: 'text-brand bg-brand/10',
+        completed: 'text-success bg-success/10',
+        failed: 'text-error bg-error/10',
+        killed: 'text-error bg-error/10',
+        start_failed: 'text-error bg-error/10',
+        paused: 'text-low bg-panel',
+      }[automation.status]
+    : '';
 
   return (
     <div className={cn('flex flex-col gap-half min-w-0', className)}>
@@ -213,6 +256,20 @@ export function KanbanCardContent<TTag extends KanbanTag = KanbanTag>({
             {displayId}
           </span>
           {isLoading && <RunningDots />}
+          {automation && (
+            <span
+              className={cn(
+                'flex min-w-0 items-center gap-[3px] rounded-sm px-half py-[1px] text-xs',
+                automationStatusClass
+              )}
+              title={`${automation.agentLabel}: ${automationStatusLabel}`}
+            >
+              <RobotIcon className="size-icon-xs shrink-0" weight="bold" />
+              <span className="max-w-24 truncate">{automation.agentLabel}</span>
+              <span aria-hidden="true">·</span>
+              <span>{automationStatusLabel}</span>
+            </span>
+          )}
         </div>
         {onMoreActionsClick && (
           <button

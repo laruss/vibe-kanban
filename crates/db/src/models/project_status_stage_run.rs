@@ -106,6 +106,27 @@ pub struct ProjectStatusStageRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct ProjectStatusStageRunSummary {
+    pub id: Uuid,
+    pub issue_id: Uuid,
+    pub project_status_id: Uuid,
+    pub status: StageRunStatus,
+    pub executor_profile_id: ExecutorProfileId,
+}
+
+impl From<ProjectStatusStageRun> for ProjectStatusStageRunSummary {
+    fn from(stage_run: ProjectStatusStageRun) -> Self {
+        Self {
+            id: stage_run.id,
+            issue_id: stage_run.issue_id,
+            project_status_id: stage_run.project_status_id,
+            status: stage_run.status,
+            executor_profile_id: stage_run.executor_profile_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct ProjectStatusStageRunResponse {
     pub stage_run: ProjectStatusStageRun,
     pub execution_process_ids: Vec<Uuid>,
@@ -119,6 +140,12 @@ pub struct IssueAutomationState {
     pub stage_runs: Vec<ProjectStatusStageRunResponse>,
     pub workflow_runs: Vec<ProjectStatusWorkflowRun>,
     pub continuations: Vec<ProjectStatusStageContinuation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct ProjectAutomationOverview {
+    pub stage_runs: Vec<ProjectStatusStageRunSummary>,
+    pub workflow_runs: Vec<ProjectStatusWorkflowRun>,
 }
 
 #[derive(Debug, Clone)]
@@ -743,6 +770,26 @@ impl ProjectStatusStageRun {
         ))
         .bind(remote_project_id)
         .bind(issue_id)
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter().map(Self::try_from).collect()
+    }
+
+    pub async fn list_latest_by_project(
+        pool: &SqlitePool,
+        remote_project_id: Uuid,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ProjectStatusStageRunRow>(&format!(
+            "{} ORDER BY updated_at DESC",
+            Self::select_sql(
+                "remote_project_id = ? AND rowid IN (\
+                    SELECT MAX(rowid) FROM project_status_stage_runs \
+                    WHERE remote_project_id = ? GROUP BY issue_id\
+                )",
+            )
+        ))
+        .bind(remote_project_id)
+        .bind(remote_project_id)
         .fetch_all(pool)
         .await?;
         rows.into_iter().map(Self::try_from).collect()
@@ -1488,6 +1535,49 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 2);
         assert_ne!(runs[0].status_entry_id, runs[1].status_entry_id);
+    }
+
+    #[tokio::test]
+    async fn project_overview_lists_only_the_latest_run_for_each_issue() {
+        let pool = migrated_pool().await;
+        let project_id = uuid::Uuid::new_v4();
+        let other_project_id = uuid::Uuid::new_v4();
+        let first_issue_id = uuid::Uuid::new_v4();
+        let second_issue_id = uuid::Uuid::new_v4();
+        let first_status_id = uuid::Uuid::new_v4();
+        let second_status_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+
+        for (project, issue, status, offset) in [
+            (project_id, first_issue_id, first_status_id, 0),
+            (project_id, first_issue_id, second_status_id, 1),
+            (project_id, second_issue_id, first_status_id, 2),
+            (other_project_id, uuid::Uuid::new_v4(), first_status_id, 3),
+        ] {
+            let configured = automation(project, status, AutomationStartMode::Manual);
+            ProjectStatusEntry::observe(
+                &pool,
+                project,
+                &observation(issue, status, now + Duration::milliseconds(offset)),
+                Some(&configured),
+            )
+            .await
+            .unwrap();
+        }
+
+        let runs = ProjectStatusStageRun::list_latest_by_project(&pool, project_id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.issue_id == first_issue_id)
+                .unwrap()
+                .project_status_id,
+            second_status_id
+        );
+        assert!(runs.iter().any(|run| run.issue_id == second_issue_id));
+        assert!(runs.iter().all(|run| run.remote_project_id == project_id));
     }
 
     #[tokio::test]

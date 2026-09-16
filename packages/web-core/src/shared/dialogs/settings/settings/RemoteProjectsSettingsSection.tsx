@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import {
@@ -68,8 +69,17 @@ import {
   TwoColumnPickerEmpty,
 } from './SettingsComponents';
 import { useSettingsDirty } from './SettingsDirtyContext';
-import type { DraftWorkspaceRepo, GitBranch, Repo } from 'shared/types';
-import { repoApi } from '@/shared/lib/api';
+import type {
+  BaseCodingAgent,
+  DraftWorkspaceRepo,
+  ExecutorProfileId,
+  GitBranch,
+  ProjectStatusAutomationProblem,
+  ProjectStatusAutomationResponse,
+  Repo,
+  UpdateProjectStatusAutomation,
+} from 'shared/types';
+import { projectStatusAutomationsApi, repoApi } from '@/shared/lib/api';
 import {
   SelectionDialog,
   type SelectionPage,
@@ -83,6 +93,12 @@ import {
   getProjectRepoDefaults,
   saveProjectRepoDefaults,
 } from '@/shared/hooks/useProjectRepoDefaults';
+import { useUserSystem } from '@/shared/hooks/useUserSystem';
+import {
+  projectAutomationKeys,
+  useProjectStatusAutomations,
+} from '@/features/project-automation/model/queries';
+import { StatusAutomationEditor } from '@/features/project-automation/views/StatusAutomationEditor';
 
 interface FormState {
   name: string;
@@ -100,6 +116,113 @@ interface StatusItem {
   hidden: boolean;
   sort_order: number;
   isNew: boolean;
+}
+
+const DEFAULT_TRANSITION_BUDGET = 10;
+const MAX_AUTOMATION_INSTRUCTIONS_BYTES = 32 * 1024;
+
+function automationToDraft(
+  response: ProjectStatusAutomationResponse
+): UpdateProjectStatusAutomation {
+  const automation = response.automation;
+  return {
+    enabled: automation.enabled,
+    executor_profile_id: automation.executor_profile_id,
+    instructions: automation.instructions,
+    start_mode: automation.start_mode,
+    session_mode: automation.session_mode,
+    completion_mode: automation.completion_mode,
+    next_status_id: automation.next_status_id,
+    transition_budget: automation.transition_budget,
+  };
+}
+
+function defaultAutomationDraft(
+  profile: ExecutorProfileId
+): UpdateProjectStatusAutomation {
+  return {
+    enabled: false,
+    executor_profile_id: profile,
+    instructions: '',
+    start_mode: 'manual',
+    session_mode: 'fresh',
+    completion_mode: 'stay',
+    next_status_id: null,
+    transition_budget: DEFAULT_TRANSITION_BUDGET,
+  };
+}
+
+function validateAutomationDraft(
+  statusId: string,
+  draft: UpdateProjectStatusAutomation,
+  statuses: StatusItem[],
+  profiles: ReturnType<typeof useUserSystem>['profiles']
+): ProjectStatusAutomationProblem[] {
+  const problems: ProjectStatusAutomationProblem[] = [];
+  const instructionsBytes = new TextEncoder().encode(draft.instructions).length;
+  const executorProfile = profiles?.[draft.executor_profile_id.executor];
+  const variant = draft.executor_profile_id.variant ?? 'DEFAULT';
+
+  if (draft.enabled && (!executorProfile || !(variant in executorProfile))) {
+    problems.push({
+      type: 'missing_profile',
+      profile_id: draft.executor_profile_id,
+    });
+  }
+  if (instructionsBytes > MAX_AUTOMATION_INSTRUCTIONS_BYTES) {
+    problems.push({
+      type: 'instructions_too_long',
+      max_bytes: MAX_AUTOMATION_INSTRUCTIONS_BYTES,
+      actual_bytes: instructionsBytes,
+    });
+  }
+  if (draft.completion_mode === 'stay' && draft.next_status_id !== null) {
+    problems.push({ type: 'next_status_not_allowed' });
+  }
+  if (draft.completion_mode === 'advance_on_success') {
+    if (!draft.next_status_id) {
+      problems.push({ type: 'next_status_required' });
+    } else if (draft.next_status_id === statusId) {
+      problems.push({ type: 'next_status_matches_current' });
+    } else if (
+      !statuses.some(
+        (status) => status.id === draft.next_status_id && !status.hidden
+      )
+    ) {
+      problems.push({
+        type: 'status_not_found_in_project',
+        reference: 'next',
+        status_id: draft.next_status_id,
+      });
+    }
+  }
+  if (draft.transition_budget < 1 || draft.transition_budget > 100) {
+    problems.push({
+      type: 'invalid_transition_budget',
+      min: 1,
+      max: 100,
+      actual: draft.transition_budget,
+    });
+  }
+
+  return problems;
+}
+
+function canSaveAutomationDraft(
+  draft: UpdateProjectStatusAutomation,
+  problems: ProjectStatusAutomationProblem[]
+): boolean {
+  const hasStructuralProblem = problems.some((problem) =>
+    [
+      'instructions_too_long',
+      'next_status_required',
+      'next_status_not_allowed',
+      'next_status_matches_current',
+      'invalid_transition_budget',
+    ].includes(problem.type)
+  );
+
+  return !hasStructuralProblem && (!draft.enabled || problems.length === 0);
 }
 
 interface StatusRowCloneProps {
@@ -150,6 +273,13 @@ interface StatusRowProps {
   onStartEditing: (id: string) => void;
   onStartEditingColor: (id: string | null) => void;
   onStopEditing: () => void;
+  automationDraft: UpdateProjectStatusAutomation;
+  automationExpanded: boolean;
+  automationProblems: ProjectStatusAutomationProblem[];
+  profiles: ReturnType<typeof useUserSystem>['profiles'];
+  statuses: StatusItem[];
+  onToggleAutomation: () => void;
+  onAutomationChange: (draft: UpdateProjectStatusAutomation) => void;
 }
 
 function StatusRow({
@@ -166,6 +296,13 @@ function StatusRow({
   onStartEditing,
   onStartEditingColor,
   onStopEditing,
+  automationDraft,
+  automationExpanded,
+  automationProblems,
+  profiles,
+  statuses,
+  onToggleAutomation,
+  onAutomationChange,
 }: StatusRowProps) {
   const { t } = useTranslation('common');
   const [localName, setLocalName] = useState(status.name);
@@ -209,7 +346,7 @@ function StatusRow({
           ref={provided.innerRef}
           {...provided.draggableProps}
           className={cn(
-            'flex items-center justify-between px-base py-half rounded-sm',
+            'overflow-hidden rounded-sm',
             status.isNew ? 'bg-panel' : 'bg-secondary',
             status.hidden && 'opacity-50',
             snapshot.isDragging && 'shadow-lg opacity-80'
@@ -219,114 +356,129 @@ function StatusRow({
             zIndex: snapshot.isDragging ? 10 : undefined,
           }}
         >
-          <div className="flex items-center gap-base">
-            <div
-              {...provided.dragHandleProps}
-              className="flex items-center justify-center size-icon-sm cursor-grab"
-            >
-              <DotsSixVerticalIcon
-                className="size-icon-xs text-low"
-                weight="bold"
-              />
+          <div className="flex items-center justify-between px-base py-half">
+            <div className="flex items-center gap-base">
+              <div
+                {...provided.dragHandleProps}
+                className="flex items-center justify-center size-icon-sm cursor-grab"
+              >
+                <DotsSixVerticalIcon
+                  className="size-icon-xs text-low"
+                  weight="bold"
+                />
+              </div>
+
+              <Popover
+                open={isEditingColor}
+                onOpenChange={(open) =>
+                  onStartEditingColor(open ? status.id : null)
+                }
+              >
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex items-center justify-center size-icon-sm"
+                    title={t('kanban.changeColor', 'Change color')}
+                  >
+                    <div
+                      className="size-dot rounded-full shrink-0"
+                      style={{ backgroundColor: `hsl(${status.color})` }}
+                    />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  className="w-auto p-base"
+                  onInteractOutside={(e) => {
+                    e.preventDefault();
+                    onStartEditingColor(null);
+                  }}
+                >
+                  <InlineColorPicker
+                    value={status.color}
+                    onChange={(color) => onColorChange(status.id, color)}
+                    colors={PRESET_COLORS}
+                  />
+                </PopoverContent>
+              </Popover>
+
+              {isEditing ? (
+                <input
+                  type="text"
+                  value={localName}
+                  onChange={(e) => setLocalName(e.target.value)}
+                  onKeyDown={handleNameKeyDown}
+                  onBlur={handleNameBlur}
+                  autoFocus
+                  className="bg-transparent text-sm text-high outline-none border-b border-brand w-24"
+                />
+              ) : (
+                <span
+                  className="text-sm text-high cursor-pointer"
+                  onClick={() => onStartEditing(status.id)}
+                >
+                  {status.name}
+                </span>
+              )}
             </div>
 
-            <Popover
-              open={isEditingColor}
-              onOpenChange={(open) =>
-                onStartEditingColor(open ? status.id : null)
-              }
-            >
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  className="flex items-center justify-center size-icon-sm"
-                  title={t('kanban.changeColor', 'Change color')}
-                >
-                  <div
-                    className="size-dot rounded-full shrink-0"
-                    style={{ backgroundColor: `hsl(${status.color})` }}
-                  />
-                </button>
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                className="w-auto p-base"
-                onInteractOutside={(e) => {
-                  e.preventDefault();
-                  onStartEditingColor(null);
-                }}
-              >
-                <InlineColorPicker
-                  value={status.color}
-                  onChange={(color) => onColorChange(status.id, color)}
-                  colors={PRESET_COLORS}
-                />
-              </PopoverContent>
-            </Popover>
-
-            {isEditing ? (
-              <input
-                type="text"
-                value={localName}
-                onChange={(e) => setLocalName(e.target.value)}
-                onKeyDown={handleNameKeyDown}
-                onBlur={handleNameBlur}
-                autoFocus
-                className="bg-transparent text-sm text-high outline-none border-b border-brand w-24"
-              />
-            ) : (
-              <span
-                className="text-sm text-high cursor-pointer"
+            <div className="flex items-center gap-base">
+              <button
+                type="button"
                 onClick={() => onStartEditing(status.id)}
+                className="flex items-center justify-center size-icon-sm text-low hover:text-normal"
+                title={t('kanban.editName', 'Edit name')}
               >
-                {status.name}
-              </span>
-            )}
+                <PencilSimpleLineIcon className="size-icon-xs" weight="bold" />
+              </button>
+              <button
+                type="button"
+                onClick={() => canDelete && onDelete(status.id)}
+                className={cn(
+                  'flex items-center justify-center size-icon-sm',
+                  canDelete
+                    ? 'text-low hover:text-normal'
+                    : 'text-low opacity-50 cursor-not-allowed'
+                )}
+                title={
+                  canDelete
+                    ? t('kanban.deleteStatus', 'Delete status')
+                    : t('kanban.cannotDeleteWithIssues', 'Move issues first')
+                }
+                disabled={!canDelete}
+              >
+                <XIcon className="size-icon-xs" weight="bold" />
+              </button>
+              <Switch
+                checked={!status.hidden}
+                onCheckedChange={(checked) =>
+                  onToggleHidden(status.id, !checked)
+                }
+                disabled={isLastVisible && !status.hidden}
+                title={
+                  isLastVisible
+                    ? t(
+                        'kanban.lastVisibleStatus',
+                        'At least one status must be visible'
+                      )
+                    : status.hidden
+                      ? t('kanban.showStatus', 'Show status')
+                      : t('kanban.hideStatus', 'Hide status')
+                }
+              />
+            </div>
           </div>
 
-          <div className="flex items-center gap-base">
-            <button
-              type="button"
-              onClick={() => onStartEditing(status.id)}
-              className="flex items-center justify-center size-icon-sm text-low hover:text-normal"
-              title={t('kanban.editName', 'Edit name')}
-            >
-              <PencilSimpleLineIcon className="size-icon-xs" weight="bold" />
-            </button>
-            <button
-              type="button"
-              onClick={() => canDelete && onDelete(status.id)}
-              className={cn(
-                'flex items-center justify-center size-icon-sm',
-                canDelete
-                  ? 'text-low hover:text-normal'
-                  : 'text-low opacity-50 cursor-not-allowed'
-              )}
-              title={
-                canDelete
-                  ? t('kanban.deleteStatus', 'Delete status')
-                  : t('kanban.cannotDeleteWithIssues', 'Move issues first')
-              }
-              disabled={!canDelete}
-            >
-              <XIcon className="size-icon-xs" weight="bold" />
-            </button>
-            <Switch
-              checked={!status.hidden}
-              onCheckedChange={(checked) => onToggleHidden(status.id, !checked)}
-              disabled={isLastVisible && !status.hidden}
-              title={
-                isLastVisible
-                  ? t(
-                      'kanban.lastVisibleStatus',
-                      'At least one status must be visible'
-                    )
-                  : status.hidden
-                    ? t('kanban.showStatus', 'Show status')
-                    : t('kanban.hideStatus', 'Hide status')
-              }
-            />
-          </div>
+          <StatusAutomationEditor
+            statusId={status.id}
+            expanded={automationExpanded}
+            draft={automationDraft}
+            profiles={profiles}
+            statuses={statuses}
+            problems={automationProblems}
+            onToggleExpanded={onToggleAutomation}
+            onChange={onAutomationChange}
+          />
         </div>
       )}
     </Draggable>
@@ -337,8 +489,10 @@ export function RemoteProjectsSettingsSection({
   initialState,
 }: RemoteProjectsSettingsSectionProps) {
   const { t } = useTranslation(['settings', 'common', 'projects']);
+  const queryClient = useQueryClient();
   const { setDirty: setContextDirty } = useSettingsDirty();
   const { isSignedIn, isLoaded } = useAuth();
+  const { profiles, config } = useUserSystem();
 
   // Selection state - initialize with provided values
   const [selectedOrgId, setSelectedOrgId] = useState<string | null>(
@@ -347,6 +501,7 @@ export function RemoteProjectsSettingsSection({
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
     initialState?.projectId ?? null
   );
+  const automationQuery = useProjectStatusAutomations(selectedProjectId);
 
   // Form state for editing
   const [formState, setFormState] = useState<FormState | null>(null);
@@ -474,6 +629,54 @@ export function RemoteProjectsSettingsSection({
     string | null
   >(null);
   const [hasStatusChanges, setHasStatusChanges] = useState(false);
+  const [automationDrafts, setAutomationDrafts] = useState<
+    Record<string, UpdateProjectStatusAutomation>
+  >({});
+  const [hasAutomationChanges, setHasAutomationChanges] = useState(false);
+  const [expandedAutomationStatusId, setExpandedAutomationStatusId] = useState<
+    string | null
+  >(null);
+
+  const availableProfiles = useMemo(
+    () => (profiles && Object.keys(profiles).length > 0 ? profiles : null),
+    [profiles]
+  );
+  const defaultExecutorProfile = useMemo<ExecutorProfileId>(() => {
+    if (config?.executor_profile) return config.executor_profile;
+    const executor = Object.keys(availableProfiles ?? {})[0] as
+      | BaseCodingAgent
+      | undefined;
+    return { executor: (executor ?? '') as BaseCodingAgent, variant: null };
+  }, [availableProfiles, config?.executor_profile]);
+  const savedAutomationsByStatus = useMemo(
+    () =>
+      new Map(
+        (automationQuery.data?.automations ?? []).map((response) => [
+          response.automation.project_status_id,
+          response,
+        ])
+      ),
+    [automationQuery.data]
+  );
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setAutomationDrafts({});
+      setHasAutomationChanges(false);
+      setExpandedAutomationStatusId(null);
+      return;
+    }
+    if (!automationQuery.data || hasAutomationChanges) return;
+
+    setAutomationDrafts(
+      Object.fromEntries(
+        automationQuery.data.automations.map((response) => [
+          response.automation.project_status_id,
+          automationToDraft(response),
+        ])
+      )
+    );
+  }, [selectedProjectId, automationQuery.data, hasAutomationChanges]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -676,7 +879,7 @@ export function RemoteProjectsSettingsSection({
     );
   }, [selectedProject, formState]);
 
-  const isDirty = isProjectDirty || hasStatusChanges;
+  const isDirty = isProjectDirty || hasStatusChanges || hasAutomationChanges;
 
   // Sync dirty state to context for unsaved changes confirmation
   useEffect(() => {
@@ -712,8 +915,25 @@ export function RemoteProjectsSettingsSection({
 
   const handleStatusDelete = useCallback((id: string) => {
     setLocalStatuses((prev) => prev.filter((status) => status.id !== id));
+    setAutomationDrafts((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setExpandedAutomationStatusId((current) =>
+      current === id ? null : current
+    );
     setHasStatusChanges(true);
   }, []);
+
+  const handleAutomationChange = useCallback(
+    (statusId: string, draft: UpdateProjectStatusAutomation) => {
+      setAutomationDrafts((prev) => ({ ...prev, [statusId]: draft }));
+      setHasAutomationChanges(true);
+    },
+    []
+  );
 
   const handleStatusAdd = useCallback(() => {
     const newId = crypto.randomUUID();
@@ -829,6 +1049,74 @@ export function RemoteProjectsSettingsSection({
     updateProjectStatus,
   ]);
 
+  const persistAutomationChanges = useCallback(async () => {
+    if (!selectedProjectId) return;
+
+    const localIds = new Set(localStatuses.map((status) => status.id));
+    for (const response of automationQuery.data?.automations ?? []) {
+      if (!localIds.has(response.automation.project_status_id)) {
+        await projectStatusAutomationsApi.delete(
+          selectedProjectId,
+          response.automation.project_status_id
+        );
+      }
+    }
+
+    for (const status of localStatuses) {
+      const draft = automationDrafts[status.id];
+      if (!draft) continue;
+
+      const original = savedAutomationsByStatus.get(status.id);
+      if (
+        original &&
+        JSON.stringify(automationToDraft(original)) === JSON.stringify(draft)
+      ) {
+        continue;
+      }
+
+      const problems = validateAutomationDraft(
+        status.id,
+        draft,
+        localStatuses,
+        availableProfiles
+      );
+      if (!canSaveAutomationDraft(draft, problems)) {
+        throw new Error(
+          `Automation for “${status.name}” has ${problems.length} validation ${problems.length === 1 ? 'error' : 'errors'}.`
+        );
+      }
+
+      const result = await projectStatusAutomationsApi.update(
+        selectedProjectId,
+        status.id,
+        draft
+      );
+      if (!result.success) {
+        const message =
+          result.error?.type === 'status_ownership_conflict'
+            ? 'The status belongs to another project.'
+            : result.error?.type === 'validation_failed'
+              ? 'The automation configuration is invalid.'
+              : result.message;
+        throw new Error(
+          `Could not save automation for “${status.name}”${message ? `: ${message}` : '.'}`
+        );
+      }
+    }
+
+    await queryClient.invalidateQueries({
+      queryKey: projectAutomationKeys.configuration(selectedProjectId),
+    });
+  }, [
+    selectedProjectId,
+    localStatuses,
+    automationDrafts,
+    automationQuery.data,
+    savedAutomationsByStatus,
+    availableProfiles,
+    queryClient,
+  ]);
+
   // Handlers
   const handleOrgSelect = (orgId: string) => {
     if (isDirty) {
@@ -842,6 +1130,9 @@ export function RemoteProjectsSettingsSection({
     setFormState(null);
     setLocalStatuses([]);
     setHasStatusChanges(false);
+    setAutomationDrafts({});
+    setHasAutomationChanges(false);
+    setExpandedAutomationStatusId(null);
     setEditingStatusId(null);
     setEditingStatusColorId(null);
     setError(null);
@@ -859,6 +1150,9 @@ export function RemoteProjectsSettingsSection({
     setSelectedProjectId(projectId);
     setFormState(project ? { name: project.name, color: project.color } : null);
     setHasStatusChanges(false);
+    setAutomationDrafts({});
+    setHasAutomationChanges(false);
+    setExpandedAutomationStatusId(null);
     setEditingStatusId(null);
     setEditingStatusColorId(null);
     setError(null);
@@ -948,6 +1242,11 @@ export function RemoteProjectsSettingsSection({
         setHasStatusChanges(false);
       }
 
+      if (hasAutomationChanges || hasStatusChanges) {
+        await persistAutomationChanges();
+        setHasAutomationChanges(false);
+      }
+
       setSuccess(
         t('settings.remoteProjects.saveSuccess', 'Project updated successfully')
       );
@@ -981,6 +1280,16 @@ export function RemoteProjectsSettingsSection({
       }))
     );
     setHasStatusChanges(false);
+    setAutomationDrafts(
+      Object.fromEntries(
+        (automationQuery.data?.automations ?? []).map((response) => [
+          response.automation.project_status_id,
+          automationToDraft(response),
+        ])
+      )
+    );
+    setHasAutomationChanges(false);
+    setExpandedAutomationStatusId(null);
     setEditingStatusId(null);
     setEditingStatusColorId(null);
   };
@@ -1436,6 +1745,30 @@ export function RemoteProjectsSettingsSection({
                         onStartEditing={setEditingStatusId}
                         onStartEditingColor={setEditingStatusColorId}
                         onStopEditing={() => setEditingStatusId(null)}
+                        automationDraft={
+                          automationDrafts[status.id] ??
+                          defaultAutomationDraft(defaultExecutorProfile)
+                        }
+                        automationExpanded={
+                          expandedAutomationStatusId === status.id
+                        }
+                        automationProblems={validateAutomationDraft(
+                          status.id,
+                          automationDrafts[status.id] ??
+                            defaultAutomationDraft(defaultExecutorProfile),
+                          localStatuses,
+                          availableProfiles
+                        )}
+                        profiles={availableProfiles}
+                        statuses={localStatuses}
+                        onToggleAutomation={() =>
+                          setExpandedAutomationStatusId((current) =>
+                            current === status.id ? null : status.id
+                          )
+                        }
+                        onAutomationChange={(draft) =>
+                          handleAutomationChange(status.id, draft)
+                        }
                       />
                     ))}
                     {provided.placeholder}

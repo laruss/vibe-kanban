@@ -19,8 +19,9 @@ use db::models::{
         ProjectStatusStageResultResponse, StageResultOutcome, StageResultRepositoryInput,
     },
     project_status_stage_run::{
-        IssueAutomationState, IssueStatusObservation, ProjectStatusEntry, ProjectStatusStageRun,
-        ProjectStatusStageRunResponse, StageRunError, StageRunTrigger,
+        IssueAutomationState, IssueStatusObservation, ProjectAutomationOverview,
+        ProjectStatusEntry, ProjectStatusStageRun, ProjectStatusStageRunResponse, StageRunError,
+        StageRunTrigger,
     },
     project_status_workflow::{
         ContinuationClaimOutcome, NewStageContinuation, ProjectStatusStageContinuation,
@@ -103,6 +104,10 @@ pub fn router() -> Router<DeploymentImpl> {
             post(observe_issue_statuses),
         )
         .route(
+            "/projects/{remote_project_id}/automation/overview",
+            get(get_project_automation_overview),
+        )
+        .route(
             "/projects/{remote_project_id}/issues/{issue_id}/automation",
             get(get_issue_automation_state),
         )
@@ -122,6 +127,28 @@ pub fn router() -> Router<DeploymentImpl> {
             "/projects/{remote_project_id}/issues/{issue_id}/automation/resume",
             post(resume_issue_automation),
         )
+}
+
+async fn get_project_automation_overview(
+    State(deployment): State<DeploymentImpl>,
+    Path(remote_project_id): Path<Uuid>,
+) -> Result<ResponseJson<ApiResponse<ProjectAutomationOverview>>, ApiError> {
+    let stage_runs =
+        ProjectStatusStageRun::list_latest_by_project(&deployment.db().pool, remote_project_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+    let workflow_runs =
+        ProjectStatusWorkflowRun::list_open_by_project(&deployment.db().pool, remote_project_id)
+            .await?;
+
+    Ok(ResponseJson(ApiResponse::success(
+        ProjectAutomationOverview {
+            stage_runs,
+            workflow_runs,
+        },
+    )))
 }
 
 pub(crate) fn spawn_workflow_worker(deployment: DeploymentImpl) {

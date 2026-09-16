@@ -795,14 +795,23 @@ impl ProjectStatusStageRun {
         rows.into_iter().map(Self::try_from).collect()
     }
 
-    pub async fn list_pending_on_enter_for_active_workflows(
+    pub async fn list_restartable_pending_on_enter(
         pool: &SqlitePool,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, ProjectStatusStageRunRow>(&format!(
             r#"{} AND trigger = 'on_enter' AND status = 'pending'
-                AND workflow_run_id IN (
-                    SELECT id FROM project_status_workflow_runs WHERE status = 'active'
-                ) ORDER BY created_at LIMIT 32"#,
+                AND (
+                    workflow_run_id IS NULL
+                    OR workflow_run_id IN (
+                        SELECT id FROM project_status_workflow_runs WHERE status = 'active'
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM project_status_entries entry
+                    WHERE entry.id = project_status_stage_runs.status_entry_id
+                      AND entry.exited_at IS NULL
+                )
+                ORDER BY created_at LIMIT 32"#,
             Self::select_sql("1 = 1")
         ))
         .fetch_all(pool)
@@ -832,7 +841,15 @@ impl ProjectStatusStageRun {
                            LIMIT 1
                        ) = 'ineligible'
                    )
-               )"#,
+               )
+                 AND (
+                     workflow_run_id IS NULL
+                     OR EXISTS (
+                         SELECT 1 FROM project_status_workflow_runs workflow
+                         WHERE workflow.id = project_status_stage_runs.workflow_run_id
+                           AND workflow.status IN ('active', 'awaiting_manual')
+                     )
+                 )"#,
         )
         .bind(id)
         .execute(&mut *transaction)
@@ -879,31 +896,49 @@ impl ProjectStatusStageRun {
 
     pub async fn assign_workspace(
         pool: &SqlitePool,
-        id: Uuid,
+        stage_run_id: Uuid,
+        attempt_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
-            r#"UPDATE project_status_stage_runs
-               SET workspace_id = ?, updated_at = datetime('now', 'subsec')
-               WHERE id = ?"#,
-        )
-        .bind(workspace_id)
-        .bind(id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
+        let attempt = sqlx::query(
             r#"UPDATE project_status_stage_attempts
                SET workspace_id = ?, updated_at = datetime('now', 'subsec')
-               WHERE id = (
-                   SELECT id FROM project_status_stage_attempts
-                   WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
-               )"#,
+               WHERE id = ? AND stage_run_id = ?
+                 AND status IN ('starting', 'running')
+                 AND id = (
+                     SELECT id FROM project_status_stage_attempts
+                     WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
+                 )"#,
         )
         .bind(workspace_id)
-        .bind(id)
+        .bind(attempt_id)
+        .bind(stage_run_id)
+        .bind(stage_run_id)
         .execute(&mut *transaction)
         .await?;
+        if attempt.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        let stage_run = sqlx::query(
+            r#"UPDATE project_status_stage_runs
+               SET workspace_id = ?, updated_at = datetime('now', 'subsec')
+               WHERE id = ? AND status IN ('starting', 'running')
+                 AND ? = (
+                     SELECT id FROM project_status_stage_attempts
+                     WHERE stage_run_id = project_status_stage_runs.id
+                     ORDER BY attempt_number DESC LIMIT 1
+                 )"#,
+        )
+        .bind(workspace_id)
+        .bind(stage_run_id)
+        .bind(attempt_id)
+        .execute(&mut *transaction)
+        .await?;
+        if stage_run.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -911,21 +946,32 @@ impl ProjectStatusStageRun {
     pub async fn attach_execution(
         pool: &SqlitePool,
         stage_run_id: Uuid,
+        attempt_id: Uuid,
         execution_process_id: Uuid,
         session_id: Uuid,
         workspace_id: Uuid,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = pool.begin().await?;
-        let attempt_id = sqlx::query_scalar::<_, Uuid>(
-            r#"SELECT id FROM project_status_stage_attempts
-               WHERE stage_run_id = ? AND status IN ('starting', 'running')
-               ORDER BY attempt_number DESC LIMIT 1"#,
+        let current_attempt = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM project_status_stage_attempts
+                   WHERE id = ? AND stage_run_id = ?
+                     AND status IN ('starting', 'running')
+                     AND id = (
+                         SELECT id FROM project_status_stage_attempts
+                         WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
+                     )
+               )"#,
         )
+        .bind(attempt_id)
         .bind(stage_run_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)?;
+        .bind(stage_run_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !current_attempt {
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         sqlx::query(
             r#"INSERT INTO project_status_stage_run_executions (
@@ -961,70 +1007,100 @@ impl ProjectStatusStageRun {
             ExecutionProcessRunReason::SetupScript => "starting",
             _ => "running",
         };
-        sqlx::query(
+        let stage_run = sqlx::query(
             r#"UPDATE project_status_stage_runs
                SET workspace_id = ?, session_id = ?, status = ?,
                    updated_at = datetime('now', 'subsec')
-               WHERE id = ?"#,
+               WHERE id = ? AND status IN ('starting', 'running')
+                 AND ? = (
+                     SELECT id FROM project_status_stage_attempts
+                     WHERE stage_run_id = project_status_stage_runs.id
+                     ORDER BY attempt_number DESC LIMIT 1
+                 )"#,
         )
         .bind(workspace_id)
         .bind(session_id)
         .bind(status)
         .bind(stage_run_id)
+        .bind(attempt_id)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
+        if stage_run.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        let attempt = sqlx::query(
             r#"UPDATE project_status_stage_attempts
                SET workspace_id = ?, session_id = ?, status = ?,
                    updated_at = datetime('now', 'subsec')
-               WHERE id = ?"#,
+               WHERE id = ? AND stage_run_id = ?
+                 AND status IN ('starting', 'running')"#,
         )
         .bind(workspace_id)
         .bind(session_id)
         .bind(status)
         .bind(attempt_id)
+        .bind(stage_run_id)
         .execute(&mut *transaction)
         .await?;
+        if attempt.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         transaction.commit().await?;
         Ok(())
     }
 
     pub async fn mark_start_failed(
         pool: &SqlitePool,
-        id: Uuid,
+        stage_run_id: Uuid,
+        attempt_id: Uuid,
         code: &str,
         message: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
-            r#"UPDATE project_status_stage_runs
-               SET status = 'start_failed', error_code = ?, error_message = ?,
-                   completed_at = datetime('now', 'subsec'),
-                   updated_at = datetime('now', 'subsec')
-               WHERE id = ?"#,
-        )
-        .bind(code)
-        .bind(message)
-        .bind(id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
+        let attempt = sqlx::query(
             r#"UPDATE project_status_stage_attempts
                SET status = 'start_failed', error_code = ?, error_message = ?,
                    completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
-               WHERE id = (
-                   SELECT id FROM project_status_stage_attempts
-                   WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
-               )"#,
+               WHERE id = ? AND stage_run_id = ?
+                 AND status IN ('starting', 'running')
+                 AND id = (
+                     SELECT id FROM project_status_stage_attempts
+                     WHERE stage_run_id = ? ORDER BY attempt_number DESC LIMIT 1
+                 )"#,
         )
         .bind(code)
         .bind(message)
-        .bind(id)
+        .bind(attempt_id)
+        .bind(stage_run_id)
+        .bind(stage_run_id)
+        .execute(&mut *transaction)
+        .await?;
+        if attempt.rows_affected() == 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        let stage_run = sqlx::query(
+            r#"UPDATE project_status_stage_runs
+               SET status = 'start_failed', error_code = ?, error_message = ?,
+                   completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ? AND status IN ('starting', 'running')
+                 AND ? = (
+                     SELECT id FROM project_status_stage_attempts
+                     WHERE stage_run_id = project_status_stage_runs.id
+                     ORDER BY attempt_number DESC LIMIT 1
+                 )"#,
+        )
+        .bind(code)
+        .bind(message)
+        .bind(stage_run_id)
+        .bind(attempt_id)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(stage_run.rows_affected() == 1)
     }
 
     pub async fn mark_chained_start_failed_for_execution(
@@ -1033,22 +1109,7 @@ impl ProjectStatusStageRun {
         message: &str,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
-            r#"UPDATE project_status_stage_runs
-               SET status = 'start_failed', error_code = 'next_action_start_failed',
-                   error_message = ?, completed_at = datetime('now', 'subsec'),
-                   updated_at = datetime('now', 'subsec')
-               WHERE id = (
-                   SELECT stage_run_id
-                   FROM project_status_stage_run_executions
-                   WHERE execution_process_id = ?
-               )"#,
-        )
-        .bind(message)
-        .bind(execution_process_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
+        let attempt = sqlx::query(
             r#"UPDATE project_status_stage_attempts
                SET status = 'start_failed', error_code = 'next_action_start_failed',
                    error_message = ?, completed_at = datetime('now', 'subsec'),
@@ -1056,12 +1117,45 @@ impl ProjectStatusStageRun {
                WHERE id = (
                    SELECT attempt_id FROM project_status_stage_attempt_executions
                    WHERE execution_process_id = ?
-               )"#,
+               ) AND status IN ('starting', 'running')
+                 AND id = (
+                     SELECT latest.id FROM project_status_stage_attempts latest
+                     WHERE latest.stage_run_id = project_status_stage_attempts.stage_run_id
+                     ORDER BY latest.attempt_number DESC LIMIT 1
+                 )"#,
         )
         .bind(message)
         .bind(execution_process_id)
         .execute(&mut *transaction)
         .await?;
+        if attempt.rows_affected() == 1 {
+            sqlx::query(
+                r#"UPDATE project_status_stage_runs
+                   SET status = 'start_failed', error_code = 'next_action_start_failed',
+                       error_message = ?, completed_at = datetime('now', 'subsec'),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = (
+                       SELECT a.stage_run_id
+                       FROM project_status_stage_attempts a
+                       JOIN project_status_stage_attempt_executions ae ON ae.attempt_id = a.id
+                       WHERE ae.execution_process_id = ?
+                   ) AND status IN ('starting', 'running')
+                     AND (
+                         SELECT ae.attempt_id
+                         FROM project_status_stage_attempt_executions ae
+                         WHERE ae.execution_process_id = ?
+                     ) = (
+                         SELECT latest.id FROM project_status_stage_attempts latest
+                         WHERE latest.stage_run_id = project_status_stage_runs.id
+                         ORDER BY latest.attempt_number DESC LIMIT 1
+                     )"#,
+            )
+            .bind(message)
+            .bind(execution_process_id)
+            .bind(execution_process_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -1070,43 +1164,173 @@ impl ProjectStatusStageRun {
         pool: &SqlitePool,
         execution_process_id: Uuid,
         execution_status: &ExecutionProcessStatus,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
+        Self::finish_for_execution_with_error(
+            pool,
+            execution_process_id,
+            execution_status,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn finish_interrupted_execution(
+        pool: &SqlitePool,
+        execution_process_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        Self::finish_for_execution_with_error(
+            pool,
+            execution_process_id,
+            &ExecutionProcessStatus::Failed,
+            Some("service_restarted"),
+            Some("The service restarted while this stage execution was active"),
+        )
+        .await
+    }
+
+    async fn finish_for_execution_with_error(
+        pool: &SqlitePool,
+        execution_process_id: Uuid,
+        execution_status: &ExecutionProcessStatus,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
         let status = match execution_status {
             ExecutionProcessStatus::Completed => "completed",
             ExecutionProcessStatus::Failed => "failed",
             ExecutionProcessStatus::Killed => "killed",
-            ExecutionProcessStatus::Running => return Ok(()),
+            ExecutionProcessStatus::Running => return Ok(false),
         };
         let mut transaction = pool.begin().await?;
-        sqlx::query(
-            r#"UPDATE project_status_stage_runs
-               SET status = ?, completed_at = datetime('now', 'subsec'),
-                   updated_at = datetime('now', 'subsec')
-               WHERE id = (
-                   SELECT stage_run_id
-                   FROM project_status_stage_run_executions
-                   WHERE execution_process_id = ?
-               )"#,
-        )
-        .bind(status)
-        .bind(execution_process_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
+        let attempt = sqlx::query(
             r#"UPDATE project_status_stage_attempts
-               SET status = ?, completed_at = datetime('now', 'subsec'),
+               SET status = ?, error_code = ?, error_message = ?,
+                   completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
                WHERE id = (
                    SELECT attempt_id FROM project_status_stage_attempt_executions
                    WHERE execution_process_id = ?
-               )"#,
+               ) AND status IN ('starting', 'running')
+                 AND id = (
+                     SELECT latest.id FROM project_status_stage_attempts latest
+                     WHERE latest.stage_run_id = project_status_stage_attempts.stage_run_id
+                     ORDER BY latest.attempt_number DESC LIMIT 1
+                 )"#,
         )
         .bind(status)
+        .bind(error_code)
+        .bind(error_message)
         .bind(execution_process_id)
         .execute(&mut *transaction)
         .await?;
+        if attempt.rows_affected() == 1 {
+            sqlx::query(
+                r#"UPDATE project_status_stage_runs
+                   SET status = ?, error_code = ?, error_message = ?,
+                       completed_at = datetime('now', 'subsec'),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = (
+                       SELECT a.stage_run_id
+                       FROM project_status_stage_attempts a
+                       JOIN project_status_stage_attempt_executions ae ON ae.attempt_id = a.id
+                       WHERE ae.execution_process_id = ?
+                   ) AND status IN ('starting', 'running')
+                     AND (
+                         SELECT ae.attempt_id
+                         FROM project_status_stage_attempt_executions ae
+                         WHERE ae.execution_process_id = ?
+                     ) = (
+                         SELECT latest.id FROM project_status_stage_attempts latest
+                         WHERE latest.stage_run_id = project_status_stage_runs.id
+                         ORDER BY latest.attempt_number DESC LIMIT 1
+                     )"#,
+            )
+            .bind(status)
+            .bind(error_code)
+            .bind(error_message)
+            .bind(execution_process_id)
+            .bind(execution_process_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
-        Ok(())
+        Ok(attempt.rows_affected() == 1)
+    }
+
+    pub async fn fail_interrupted_attempts(pool: &SqlitePool) -> Result<Vec<Uuid>, sqlx::Error> {
+        let mut transaction = pool.begin().await?;
+        let attempts = sqlx::query_as::<_, (Uuid, Uuid, bool)>(
+            r#"SELECT a.id, a.stage_run_id,
+                      EXISTS(
+                          SELECT 1 FROM project_status_stage_attempt_executions ae
+                          WHERE ae.attempt_id = a.id
+                      ) AS has_execution
+               FROM project_status_stage_attempts a
+               JOIN project_status_stage_runs sr ON sr.id = a.stage_run_id
+               WHERE a.status IN ('starting', 'running')
+                 AND sr.status IN ('starting', 'running')
+                 AND a.id = (
+                     SELECT latest.id FROM project_status_stage_attempts latest
+                     WHERE latest.stage_run_id = a.stage_run_id
+                     ORDER BY latest.attempt_number DESC LIMIT 1
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM project_status_stage_attempt_executions ae
+                     JOIN execution_processes ep ON ep.id = ae.execution_process_id
+                     WHERE ae.attempt_id = a.id AND ep.status = 'running'
+                 )"#,
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        let mut reconciled = Vec::with_capacity(attempts.len());
+        for (attempt_id, stage_run_id, has_execution) in attempts {
+            let status = if has_execution {
+                "failed"
+            } else {
+                "start_failed"
+            };
+            let changed = sqlx::query(
+                r#"UPDATE project_status_stage_attempts
+                   SET status = ?, error_code = 'service_restarted',
+                       error_message = 'The service restarted before this stage attempt finished',
+                       completed_at = datetime('now', 'subsec'),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = ? AND stage_run_id = ?
+                     AND status IN ('starting', 'running')"#,
+            )
+            .bind(status)
+            .bind(attempt_id)
+            .bind(stage_run_id)
+            .execute(&mut *transaction)
+            .await?;
+            if changed.rows_affected() == 0 {
+                continue;
+            }
+            sqlx::query(
+                r#"UPDATE project_status_stage_runs
+                   SET status = ?, error_code = 'service_restarted',
+                       error_message = 'The service restarted before this stage attempt finished',
+                       completed_at = datetime('now', 'subsec'),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = ? AND status IN ('starting', 'running')
+                     AND ? = (
+                         SELECT latest.id FROM project_status_stage_attempts latest
+                         WHERE latest.stage_run_id = project_status_stage_runs.id
+                         ORDER BY latest.attempt_number DESC LIMIT 1
+                     )"#,
+            )
+            .bind(status)
+            .bind(stage_run_id)
+            .bind(attempt_id)
+            .execute(&mut *transaction)
+            .await?;
+            reconciled.push(attempt_id);
+        }
+        transaction.commit().await?;
+        Ok(reconciled)
     }
 
     pub async fn stage_run_id_for_execution(
@@ -1304,7 +1528,7 @@ fn invalid_data(message: String) -> sqlx::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
     use chrono::{Duration, Utc};
     use executors::{
@@ -1315,6 +1539,8 @@ mod tests {
         profile::{ExecutorConfig, ExecutorProfileId},
     };
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tokio::sync::Barrier;
+    use uuid::Uuid;
 
     use super::{
         IssueStatusObservation, ProjectStatusEntry, ProjectStatusStageRun, StageRunError,
@@ -1405,6 +1631,34 @@ mod tests {
         assert!(outcome.entry.is_some());
         assert!(outcome.stage_run.is_none());
         assert!(!outcome.should_start);
+    }
+
+    #[tokio::test]
+    async fn project_without_automation_creates_no_stage_history() {
+        let pool = migrated_pool().await;
+        let project_id = uuid::Uuid::new_v4();
+        let issue_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+
+        for (offset, status_id) in [(0, uuid::Uuid::new_v4()), (1, uuid::Uuid::new_v4())] {
+            let outcome = ProjectStatusEntry::observe(
+                &pool,
+                project_id,
+                &observation(issue_id, status_id, now + Duration::milliseconds(offset)),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.stage_run.is_none());
+            assert!(!outcome.should_start);
+        }
+
+        assert!(
+            ProjectStatusStageRun::list_by_issue(&pool, project_id, issue_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1535,6 +1789,73 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 2);
         assert_ne!(runs[0].status_entry_id, runs[1].status_entry_id);
+    }
+
+    #[tokio::test]
+    async fn disabling_automation_preserves_history_and_blocks_future_runs() {
+        let pool = migrated_pool().await;
+        let project_id = uuid::Uuid::new_v4();
+        let issue_id = uuid::Uuid::new_v4();
+        let other_status_id = uuid::Uuid::new_v4();
+        let automated_status_id = uuid::Uuid::new_v4();
+        let mut configured = automation(
+            project_id,
+            automated_status_id,
+            AutomationStartMode::OnEnter,
+        );
+        let now = Utc::now();
+
+        ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, other_status_id, now),
+            None,
+        )
+        .await
+        .unwrap();
+        let first = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(
+                issue_id,
+                automated_status_id,
+                now + Duration::milliseconds(1),
+            ),
+            Some(&configured),
+        )
+        .await
+        .unwrap();
+        let historical_run_id = first.stage_run.unwrap().id;
+
+        ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, other_status_id, now + Duration::milliseconds(2)),
+            None,
+        )
+        .await
+        .unwrap();
+        configured.enabled = false;
+        let disabled_reentry = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(
+                issue_id,
+                automated_status_id,
+                now + Duration::milliseconds(3),
+            ),
+            Some(&configured),
+        )
+        .await
+        .unwrap();
+
+        assert!(disabled_reentry.stage_run.is_none());
+        assert!(!disabled_reentry.should_start);
+        let runs = ProjectStatusStageRun::list_by_issue(&pool, project_id, issue_id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, historical_run_id);
     }
 
     #[tokio::test]
@@ -1676,6 +1997,10 @@ mod tests {
         ProjectStatusStageRun::claim_start(&pool, stage_run.id)
             .await
             .unwrap();
+        let attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let workspace = Workspace::create(
             &pool,
@@ -1735,6 +2060,7 @@ mod tests {
         ProjectStatusStageRun::attach_execution(
             &pool,
             stage_run.id,
+            attempt.id,
             execution.id,
             session.id,
             workspace.id,
@@ -1889,6 +2215,7 @@ mod tests {
         ProjectStatusStageRun::mark_start_failed(
             &pool,
             stage_run.id,
+            first.id,
             "workspace_missing",
             "Workspace unavailable",
         )
@@ -1947,13 +2274,18 @@ mod tests {
         ProjectStatusStageRun::claim_start(&pool, first_run.id)
             .await
             .unwrap();
-        ProjectStatusStageRun::assign_workspace(&pool, first_run.id, workspace_id)
-            .await
-            .unwrap();
         let first_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, first_run.id)
             .await
             .unwrap()
             .unwrap();
+        ProjectStatusStageRun::assign_workspace(
+            &pool,
+            first_run.id,
+            first_attempt.id,
+            workspace_id,
+        )
+        .await
+        .unwrap();
         sqlx::query(
             r#"UPDATE project_status_stage_attempts
                SET status = 'completed', completed_at = datetime('now', 'subsec')
@@ -1990,19 +2322,25 @@ mod tests {
         ProjectStatusStageRun::claim_start(&pool, failed_run.id)
             .await
             .unwrap();
-        ProjectStatusStageRun::assign_workspace(&pool, failed_run.id, workspace_id)
-            .await
-            .unwrap();
         let failed_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, failed_run.id)
             .await
             .unwrap()
             .unwrap();
+        ProjectStatusStageRun::assign_workspace(
+            &pool,
+            failed_run.id,
+            failed_attempt.id,
+            workspace_id,
+        )
+        .await
+        .unwrap();
         ProjectStatusStageAttempt::set_input_result(&pool, failed_attempt.id, Some(successful.id))
             .await
             .unwrap();
         ProjectStatusStageRun::mark_start_failed(
             &pool,
             failed_run.id,
+            failed_attempt.id,
             "executor_unavailable",
             "Executor unavailable",
         )
@@ -2065,6 +2403,14 @@ mod tests {
         ProjectStatusStageRun::claim_start(&pool, second.id)
             .await
             .unwrap();
+        let first_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, second.id)
+            .await
+            .unwrap()
+            .unwrap();
 
         let workspace = Workspace::create(
             &pool,
@@ -2110,6 +2456,7 @@ mod tests {
         ProjectStatusStageRun::attach_execution(
             &pool,
             first.id,
+            first_attempt.id,
             execution.id,
             session.id,
             workspace.id,
@@ -2121,6 +2468,7 @@ mod tests {
             ProjectStatusStageRun::attach_execution(
                 &pool,
                 second.id,
+                second_attempt.id,
                 execution.id,
                 session.id,
                 workspace.id,
@@ -2134,6 +2482,276 @@ mod tests {
                 .await
                 .unwrap(),
             Some(first.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_on_enter_without_workflow_is_restartable() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let configured = automation(project_id, status_id, AutomationStartMode::OnEnter);
+        let mut entered = observation(issue_id, status_id, Utc::now());
+        entered.entered = true;
+
+        let stage_run = ProjectStatusEntry::observe(&pool, project_id, &entered, Some(&configured))
+            .await
+            .unwrap()
+            .stage_run
+            .unwrap();
+        assert!(stage_run.workflow_run_id.is_none());
+
+        let restartable = ProjectStatusStageRun::list_restartable_pending_on_enter(&pool)
+            .await
+            .unwrap();
+        assert_eq!(restartable.len(), 1);
+        assert_eq!(restartable[0].id, stage_run.id);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_is_conservative_and_idempotent() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+        let configured = automation(project_id, status_id, AutomationStartMode::Manual);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(Uuid::new_v4(), status_id, Utc::now()),
+            Some(&configured),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
+        let attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            ProjectStatusStageRun::fail_interrupted_attempts(&pool)
+                .await
+                .unwrap(),
+            vec![attempt.id]
+        );
+        assert!(
+            ProjectStatusStageRun::fail_interrupted_attempts(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let recovered = ProjectStatusStageAttempt::find_by_id(&pool, attempt.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, StageRunStatus::StartFailed);
+        assert_eq!(recovered.error_code.as_deref(), Some("service_restarted"));
+
+        assert_eq!(
+            ProjectStatusStageAttempt::list_unmaterialized_terminal(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|attempt| attempt.id)
+                .collect::<Vec<_>>(),
+            vec![attempt.id]
+        );
+        let result = ProjectStatusStageResult::materialize_for_attempt(&pool, attempt.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.outcome, StageResultOutcome::StartFailed);
+        assert!(
+            ProjectStatusStageAttempt::list_unmaterialized_terminal(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_execution_completion_cannot_overwrite_retry() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+        let configured = automation(project_id, status_id, AutomationStartMode::Manual);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(Uuid::new_v4(), status_id, Utc::now()),
+            Some(&configured),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
+        let first_attempt = ProjectStatusStageAttempt::latest_for_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let workspace = Workspace::create(
+            &pool,
+            &CreateWorkspace {
+                branch: "stale-callback".to_string(),
+                name: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let session = Session::create(
+            &pool,
+            &CreateSession {
+                executor: Some(BaseCodingAgent::Codex.to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace.id,
+        )
+        .await
+        .unwrap();
+        let execution = ExecutionProcess::create(
+            &pool,
+            &CreateExecutionProcess {
+                session_id: session.id,
+                executor_action: ExecutorAction::new(
+                    ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                        prompt: "test".to_string(),
+                        executor_config: ExecutorConfig::from(
+                            configured.executor_profile_id.clone(),
+                        ),
+                        working_dir: None,
+                    }),
+                    None,
+                ),
+                run_reason: ExecutionProcessRunReason::CodingAgent,
+            },
+            Uuid::new_v4(),
+            &[],
+        )
+        .await
+        .unwrap();
+        ProjectStatusStageRun::attach_execution(
+            &pool,
+            stage_run.id,
+            first_attempt.id,
+            execution.id,
+            session.id,
+            workspace.id,
+            &ExecutionProcessRunReason::CodingAgent,
+        )
+        .await
+        .unwrap();
+        ProjectStatusStageRun::mark_start_failed(
+            &pool,
+            stage_run.id,
+            first_attempt.id,
+            "retryable",
+            "retry this stage",
+        )
+        .await
+        .unwrap();
+
+        ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+            .await
+            .unwrap();
+        let retry = ProjectStatusStageAttempt::latest_for_stage_run(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectStatusStageRun::finish_for_execution(
+            &pool,
+            execution.id,
+            &ExecutionProcessStatus::Completed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ProjectStatusStageRun::find_by_id(&pool, stage_run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageRunStatus::Starting
+        );
+        assert_eq!(
+            ProjectStatusStageAttempt::find_by_id(&pool, retry.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageRunStatus::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_stage_claims_create_one_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("workflow.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .busy_timeout(StdDuration::from_secs(2));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::run_migrations(&pool).await.unwrap();
+
+        let project_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+        let configured = automation(project_id, status_id, AutomationStartMode::Manual);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(Uuid::new_v4(), status_id, Utc::now()),
+            Some(&configured),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            let stage_run_id = stage_run.id;
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                ProjectStatusStageRun::claim_start(&pool, stage_run_id).await
+            }));
+        }
+        barrier.wait().await;
+        let mut successes = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => successes += 1,
+                Err(StageRunError::CannotStart(_)) => rejected += 1,
+                Err(error) => panic!("unexpected claim error: {error}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(rejected, 1);
+        assert_eq!(
+            ProjectStatusStageAttempt::list_by_stage_run(&pool, stage_run.id)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

@@ -17,9 +17,7 @@ use db::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
         execution_process_repo_state::ExecutionProcessRepoState,
-        project_status_stage_result::{
-            ProjectStatusStageAttempt, ProjectStatusStageResult,
-        },
+        project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
         project_status_stage_run::ProjectStatusStageRun,
         repo::Repo,
         scratch::{DraftFollowUpData, Scratch, ScratchType},
@@ -366,12 +364,9 @@ impl LocalContainerService {
         else {
             return Ok(());
         };
-        let mut repositories = ProjectStatusStageAttempt::repository_inputs(
-            &self.db.pool,
-            attempt_id,
-            &ctx.repos,
-        )
-        .await?;
+        let mut repositories =
+            ProjectStatusStageAttempt::repository_inputs(&self.db.pool, attempt_id, &ctx.repos)
+                .await?;
 
         for repo in &ctx.repos {
             let repo_path = workspace_root.join(&repo.name);
@@ -1171,18 +1166,16 @@ impl LocalContainerService {
         };
 
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
-        let stage_run_id = ProjectStatusStageRun::stage_run_id_for_execution(
-            &self.db.pool,
-            ctx.execution_process.id,
-        )
-        .await?;
+        let stage_attempt_id =
+            ProjectStatusStageAttempt::id_for_execution(&self.db.pool, ctx.execution_process.id)
+                .await?;
 
         self.start_execution_for_stage(
             &ctx.workspace,
             &ctx.session,
             &action,
             &ExecutionProcessRunReason::CodingAgent,
-            stage_run_id,
+            stage_attempt_id,
         )
         .await
     }

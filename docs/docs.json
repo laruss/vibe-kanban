@@ -104,6 +104,7 @@
         "group": "Self-Hosting",
         "pages": [
           "self-hosting/local-development",
+          "self-hosting/local-mac-service",
           "self-hosting/deploy-docker"
         ]
       },

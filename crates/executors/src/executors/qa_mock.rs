@@ -1,14 +1,13 @@
 //! QA Mode: Mock executor for testing
 //!
 //! This module provides a mock executor that:
-//! 1. Performs random file operations (create, delete, modify)
+//! 1. Performs deterministic file operations (create, delete, modify)
 //! 2. Streams 10 mock log entries over 10 seconds
 //! 3. Outputs logs in ClaudeJson format for compatibility with existing log normalization
 
 use std::{path::Path, process::Stdio, sync::Arc};
 
 use async_trait::async_trait;
-use rand::seq::SliceRandom as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -44,7 +43,7 @@ impl StandardCodingAgentExecutor for QaMockExecutor {
         info!("QA Mock Executor: spawning mock execution");
 
         // 1. Perform file operations before spawning the log output process
-        perform_file_operations(current_dir).await;
+        perform_file_operations(current_dir, prompt).await;
 
         // 2. Generate mock logs and write to temp file to avoid shell escaping issues
         let logs = generate_mock_logs(prompt);
@@ -121,73 +120,53 @@ impl StandardCodingAgentExecutor for QaMockExecutor {
     }
 }
 
-/// Perform random file operations in the worktree
-async fn perform_file_operations(dir: &Path) {
+/// Perform repeatable file operations in a disposable QA worktree.
+async fn perform_file_operations(dir: &Path, prompt: &str) {
     info!("QA Mock: performing file operations in {:?}", dir);
 
-    // Create: qa_created_{uuid}.txt
-    let uuid = uuid::Uuid::new_v4();
-    let new_file = dir.join(format!("qa_created_{}.txt", uuid));
-    match tokio::fs::write(&new_file, "QA mode created this file\n").await {
+    let new_file = dir.join("qa_created.txt");
+    let created_content = format!("QA mode processed this prompt:\n{prompt}\n");
+    match tokio::fs::write(&new_file, created_content).await {
         Ok(_) => info!("QA Mock: created file {:?}", new_file),
         Err(e) => warn!("QA Mock: failed to create file: {}", e),
     }
 
-    // Find files (excluding .git and binary files)
-    let files: Vec<_> = walkdir::WalkDir::new(dir)
+    // Sort candidates so the same fixture always receives the same operations.
+    let mut files: Vec<_> = walkdir::WalkDir::new(dir)
         .max_depth(3) // Limit depth to avoid long walks
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| !e.path().to_string_lossy().contains(".git"))
+        .filter(|e| e.path() != new_file)
         .filter(|e| {
             e.path()
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ["rs", "ts", "js", "txt", "md", "json"].contains(&ext))
         })
+        .map(|entry| entry.into_path())
         .collect();
+    files.sort();
 
     if files.len() >= 2 {
-        // Pick random indices before any await points (thread_rng is not Send)
-        let (remove_idx, modify_idx) = {
-            let mut rng = rand::thread_rng();
-            let mut indices: Vec<usize> = (0..files.len()).collect();
-            indices.shuffle(&mut rng);
-            (indices.first().copied(), indices.get(1).copied())
-        };
-
-        // Remove a random file (first shuffled index)
-        if let Some(idx) = remove_idx {
-            let file_to_remove = files[idx].path().to_path_buf();
-            // Don't remove the file we just created
-            if file_to_remove != new_file {
-                match tokio::fs::remove_file(&file_to_remove).await {
-                    Ok(_) => info!("QA Mock: removed file {:?}", file_to_remove),
-                    Err(e) => warn!("QA Mock: failed to remove file: {}", e),
-                }
+        if let Some(file_to_remove) = files.first() {
+            match tokio::fs::remove_file(file_to_remove).await {
+                Ok(_) => info!("QA Mock: removed file {:?}", file_to_remove),
+                Err(e) => warn!("QA Mock: failed to remove file: {}", e),
             }
         }
 
-        // Modify a different random file (second shuffled index)
-        if let Some(idx) = modify_idx {
-            let file_to_modify = files[idx].path().to_path_buf();
-            // Don't modify the file we just created
-            if file_to_modify != new_file {
-                match tokio::fs::read_to_string(&file_to_modify).await {
-                    Ok(content) => {
-                        let modified = format!(
-                            "{}\n// QA modification at {}\n",
-                            content,
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-                        );
-                        match tokio::fs::write(&file_to_modify, modified).await {
-                            Ok(_) => info!("QA Mock: modified file {:?}", file_to_modify),
-                            Err(e) => warn!("QA Mock: failed to write modified file: {}", e),
-                        }
+        if let Some(file_to_modify) = files.get(1) {
+            match tokio::fs::read_to_string(file_to_modify).await {
+                Ok(content) => {
+                    let modified = format!("{content}\n// QA deterministic modification\n");
+                    match tokio::fs::write(file_to_modify, modified).await {
+                        Ok(_) => info!("QA Mock: modified file {:?}", file_to_modify),
+                        Err(e) => warn!("QA Mock: failed to write modified file: {}", e),
                     }
-                    Err(e) => warn!("QA Mock: failed to read file for modification: {}", e),
                 }
+                Err(e) => warn!("QA Mock: failed to read file for modification: {}", e),
             }
         }
     } else {
@@ -389,6 +368,34 @@ fn generate_mock_logs(prompt: &str) -> Vec<String> {
     logs.into_iter()
         .map(|log| serde_json::to_string(&log).expect("ClaudeJson should serialize"))
         .collect()
+}
+
+#[cfg(test)]
+mod file_operation_tests {
+    use super::perform_file_operations;
+
+    #[tokio::test]
+    async fn file_operations_are_deterministic_for_a_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let removed = directory.path().join("a.txt");
+        let modified = directory.path().join("b.md");
+        tokio::fs::write(&removed, "remove me\n").await.unwrap();
+        tokio::fs::write(&modified, "keep me\n").await.unwrap();
+
+        perform_file_operations(directory.path(), "fixed prompt").await;
+
+        assert!(!removed.exists());
+        assert_eq!(
+            tokio::fs::read_to_string(&modified).await.unwrap(),
+            "keep me\n\n// QA deterministic modification\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(directory.path().join("qa_created.txt"))
+                .await
+                .unwrap(),
+            "QA mode processed this prompt:\nfixed prompt\n"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2,9 +2,12 @@ use directories::ProjectDirs;
 use rust_embed::RustEmbed;
 
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+pub const DATA_DIR_ENV: &str = "VIBE_KANBAN_DATA_DIR";
 
 pub fn asset_dir() -> std::path::PathBuf {
-    let path = if cfg!(debug_assertions) {
+    let path = if let Some(path) = std::env::var_os(DATA_DIR_ENV).filter(|path| !path.is_empty()) {
+        std::path::PathBuf::from(path)
+    } else if cfg!(debug_assertions) {
         std::path::PathBuf::from(PROJECT_ROOT).join("../../dev_assets")
     } else {
         prod_asset_dir_path()

@@ -1,0 +1,259 @@
+---
+title: "Run Vibe Kanban as a macOS service"
+description: "Build, validate, upgrade, and roll back a continuously running local Vibe Kanban service on macOS."
+---
+
+Use a launch agent to run Vibe Kanban continuously on a Mac mini or another
+macOS host. The packaged server includes the local web application and binds to
+localhost by default.
+
+<Warning>
+Never run two automation-enabled instances against the same remote project.
+Separate data directories prevent local database corruption, but they cannot
+prevent two independent instances from both changing the same remote issue.
+</Warning>
+
+## Prerequisites
+
+You need:
+
+- macOS on Apple silicon or Intel
+- Node.js 20 or later and pnpm 8 or later
+- a stable Rust toolchain and the Xcode Command Line Tools
+- each agent CLI that your configured executor profiles use
+- an authenticated Vibe Kanban account if you use remote projects
+
+Run the following checks from the repository root:
+
+```bash
+node --version
+pnpm --version
+rustc --version
+xcode-select --print-path
+```
+
+## Build a production package
+
+Install locked dependencies, run the checks, and build the archive:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm run check
+pnpm run build:local-service
+```
+
+The build creates a versioned archive and SHA-256 file under
+`dist/local-service/`. Verify the archive before installing it:
+
+```bash
+cd dist/local-service
+shasum --check vibe-kanban-*-macos-*.tar.gz.sha256
+tar -tzf vibe-kanban-*-macos-*.tar.gz
+```
+
+The archive contains the production server binary and a launch agent template.
+The template disables automatic browser opening because launchd starts the
+service without an interactive terminal.
+
+## Test a side-by-side candidate
+
+A candidate needs its own ports, data directory, instance ID, and log directory.
+Start with automation disabled so the candidate cannot automatically start a
+stage or advance a remote issue.
+
+<Steps>
+<Step title="Extract the candidate">
+  Extract the archive into a versioned release directory outside the Git
+  checkout. In the commands below, replace `CANDIDATE_VERSION` with the archive
+  directory name.
+
+  ```bash
+  mkdir -p "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/releases"
+  tar -xzf dist/local-service/vibe-kanban-*-macos-*.tar.gz \
+    -C "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/releases"
+  ```
+</Step>
+
+<Step title="Create isolated runtime directories">
+  ```bash
+  mkdir -p "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/data"
+  mkdir -p "${HOME}/Library/Logs/Vibe Kanban Service/candidate"
+  ```
+
+  Use a fresh data directory for an empty canary. Do not point the candidate at
+  the production data directory. The service holds an exclusive lock on its
+  data directory and refuses to start if another process owns it.
+</Step>
+
+<Step title="Configure the launch agent">
+  Copy the packaged template to `~/Library/LaunchAgents`:
+
+  ```bash
+  cp "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/releases/CANDIDATE_VERSION/ai.bloop.vibe-kanban.local.plist.template" \
+    "${HOME}/Library/LaunchAgents/ai.bloop.vibe-kanban.canary.plist"
+  ```
+
+  Replace every placeholder in the copied file with an absolute value:
+
+  | Placeholder | Candidate value |
+  | --- | --- |
+  | `__LABEL__` | `ai.bloop.vibe-kanban.canary` |
+  | `__BINARY_PATH__` | Absolute path to the packaged `vibe-kanban` binary |
+  | `__BACKEND_PORT__` | An unused port, for example `3101` |
+  | `__PREVIEW_PROXY_PORT__` | Another unused port, for example `3102` |
+  | `__HOME__` | Your absolute home directory |
+  | `__PATH__` | Absolute search paths for Git and your agent CLIs |
+  | `__DATA_DIR__` | The isolated candidate data directory |
+  | `__INSTANCE_ID__` | `vibe-kanban-canary` |
+  | `__AUTOMATION_DISABLED__` | `1` |
+  | `__LOG_DIR__` | The candidate log directory |
+
+  `VIBE_KANBAN_INSTANCE_ID` may contain only ASCII letters, numbers, `.`, `_`,
+  and `-`. launchd does not expand `~` or shell variables inside a property
+  list, so use absolute paths.
+
+  Validate the completed file:
+
+  ```bash
+  plutil -lint "${HOME}/Library/LaunchAgents/ai.bloop.vibe-kanban.canary.plist"
+  ```
+</Step>
+
+<Step title="Start and verify the candidate">
+  ```bash
+  launchctl bootstrap "gui/$(id -u)" \
+    "${HOME}/Library/LaunchAgents/ai.bloop.vibe-kanban.canary.plist"
+  curl --fail --silent http://127.0.0.1:3101/api/health
+  ```
+
+  The health response contains `"data":"OK"`. Open
+  `http://127.0.0.1:3101` and verify normal manual board behaviour. With
+  `VIBE_KANBAN_AUTOMATION_DISABLED=1`, automatic starts and manual stage-start
+  API requests are blocked on this instance.
+
+  Inspect logs if the check fails:
+
+  ```bash
+  tail -n 200 "${HOME}/Library/Logs/Vibe Kanban Service/candidate/stderr.log"
+  ```
+</Step>
+</Steps>
+
+## Rehearse the data migration
+
+Test migrations against a disposable copy before cutover. Because SQLite uses
+multiple files and the service also stores configuration and execution logs in
+the data directory, copy the whole directory while the source service is
+stopped.
+
+<Steps>
+<Step title="Stop both instances">
+  Stop the candidate, then stop the current production process using the method
+  that originally started it.
+
+  ```bash
+  launchctl bootout "gui/$(id -u)/ai.bloop.vibe-kanban.canary"
+  ```
+</Step>
+
+<Step title="Copy production data into the disposable candidate directory">
+  Move the empty candidate data directory aside, then copy the production data
+  directory with `ditto`. Replace `PRODUCTION_DATA_DIR` with its absolute path.
+
+  ```bash
+  mv "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/data" \
+    "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/data.empty"
+  ditto "PRODUCTION_DATA_DIR" \
+    "${HOME}/Library/Application Support/Vibe Kanban Service/candidate/data"
+  ```
+</Step>
+
+<Step title="Restart production and validate the copy">
+  Restart the current production service first. Then bootstrap the candidate
+  with automation still disabled. Check the health endpoint, open existing
+  projects, and verify that historical stage runs and attempts are readable.
+
+  Do not start stages or edit remote issues from the copied candidate. The copy
+  contains production identifiers and credentials even though its automatic
+  worker is disabled.
+</Step>
+</Steps>
+
+## Cut over to the service
+
+1. Stop the candidate and the old production process.
+2. Back up the old production data directory with `ditto` and record the old
+   binary version.
+3. Point the production launch agent at the new versioned binary and the real
+   production data directory.
+4. Keep `VIBE_KANBAN_AUTOMATION_DISABLED=1` for the first start. Bootstrap the
+   agent and verify health, projects, credentials, profiles, repositories, and
+   historical stage data.
+5. Stop the launch agent, change the `VIBE_KANBAN_AUTOMATION_DISABLED` value
+   from `1` to `0`, validate the property list, and bootstrap it again.
+6. Trigger one controlled on-enter workflow and confirm its stage, hand-off,
+   workspace reuse, and transition logs before enabling more projects.
+
+The server reconciles interrupted work during startup. It records active stage
+attempts as failed with `service_restarted`, materialises missing failure
+results from persisted database state, and requeues interrupted continuation
+claims. It never converts interrupted work into success.
+
+## Upgrade
+
+For each upgrade:
+
+1. Build and verify a new versioned package.
+2. Test it side by side with isolated data and automation disabled.
+3. Stop production and create a full data-directory backup.
+4. Update only the launch agent's binary path to the new version.
+5. Start with automation disabled, validate the migrated data, then enable
+   automation after a controlled test.
+
+Keep at least the previous binary and its matching pre-upgrade data backup.
+For example, while production is stopped, replace the two placeholders below
+with absolute paths:
+
+```bash
+mkdir -p "${HOME}/Library/Application Support/Vibe Kanban Service/backups"
+ditto "PRODUCTION_DATA_DIR" "PRE_UPGRADE_BACKUP_DIR"
+```
+
+## Roll back
+
+Database migrations are forward-only. Do not run an older binary against a
+database that a newer binary has migrated.
+
+1. Stop the launch agent.
+2. Move the failed data directory aside for diagnosis.
+3. Restore the complete pre-upgrade data-directory backup.
+4. Restore the launch agent's previous binary path.
+5. Set `VIBE_KANBAN_AUTOMATION_DISABLED=1` and bootstrap the service.
+6. Verify health and historical data before enabling automation.
+
+Use `ditto` for the restore so configuration, credentials, execution logs, and
+the SQLite database stay together:
+
+```bash
+mv "PRODUCTION_DATA_DIR" "FAILED_DATA_DIR"
+ditto "PRE_UPGRADE_BACKUP_DIR" "PRODUCTION_DATA_DIR"
+```
+
+<Warning>
+A rollback restores local state only. It cannot undo Git commits, created
+worktrees, agent side effects, or remote issue transitions that happened before
+the service stopped. Review those systems separately before resuming automation.
+</Warning>
+
+## Troubleshoot startup failures
+
+- **Another process owns the data directory:** stop that process or configure a
+  different `VIBE_KANBAN_DATA_DIR`. Never delete `instance.lock` to bypass the
+  lock.
+- **A port is already in use:** choose distinct backend and preview proxy ports,
+  then reload the launch agent.
+- **An executor is missing:** add its absolute installation directory to the
+  launch agent's `PATH`; launchd does not load your interactive shell profile.
+- **A workflow pauses after restart:** inspect the structured log fields for the
+  issue, status entry, stage run, attempt, workspace, session, execution,
+  result, continuation, and workflow IDs before retrying.

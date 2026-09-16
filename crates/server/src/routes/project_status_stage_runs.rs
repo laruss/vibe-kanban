@@ -60,6 +60,8 @@ use crate::{
     },
 };
 
+const AUTOMATION_DISABLED_ENV: &str = "VIBE_KANBAN_AUTOMATION_DISABLED";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct ObserveIssueStatusesRequest {
     pub observations: Vec<IssueStatusObservation>,
@@ -152,6 +154,13 @@ async fn get_project_automation_overview(
 }
 
 pub(crate) fn spawn_workflow_worker(deployment: DeploymentImpl) {
+    if !automation_runtime_enabled() {
+        tracing::warn!(
+            environment_variable = AUTOMATION_DISABLED_ENV,
+            "Project status automation worker is disabled for this service instance"
+        );
+        return;
+    }
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
@@ -164,24 +173,72 @@ pub(crate) fn spawn_workflow_worker(deployment: DeploymentImpl) {
 }
 
 async fn process_workflow_continuations_once(deployment: &DeploymentImpl) -> Result<(), ApiError> {
-    ProjectStatusStageContinuation::requeue_stale_claims(&deployment.db().pool).await?;
-
     for result in ProjectStatusStageResult::list_without_continuation(&deployment.db().pool).await?
     {
-        prepare_stage_continuation(deployment, &result).await?;
+        if let Err(error) = prepare_stage_continuation(deployment, &result).await {
+            tracing::error!(
+                %error,
+                remote_project_id = %result.remote_project_id,
+                issue_id = %result.issue_id,
+                project_status_id = %result.project_status_id,
+                status_entry_id = %result.status_entry_id,
+                stage_run_id = %result.stage_run_id,
+                stage_attempt_id = %result.attempt_id,
+                stage_result_id = %result.id,
+                "Failed to prepare project status stage continuation"
+            );
+        }
     }
 
     for continuation in ProjectStatusStageContinuation::list_pending(&deployment.db().pool).await? {
-        if ProjectStatusStageContinuation::claim(&deployment.db().pool, continuation.id).await?
-            == ContinuationClaimOutcome::Claimed
+        let claim =
+            match ProjectStatusStageContinuation::claim(&deployment.db().pool, continuation.id)
+                .await
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        continuation_id = %continuation.id,
+                        workflow_run_id = %continuation.workflow_run_id,
+                        stage_result_id = %continuation.result_id,
+                        stage_run_id = %continuation.source_stage_run_id,
+                        "Failed to claim project status stage continuation"
+                    );
+                    continue;
+                }
+            };
+        if let ContinuationClaimOutcome::Claimed { token } = claim
+            && let Err(error) = apply_stage_continuation(deployment, continuation.id, token).await
         {
-            apply_stage_continuation(deployment, continuation.id).await?;
+            tracing::error!(
+                %error,
+                continuation_id = %continuation.id,
+                workflow_run_id = %continuation.workflow_run_id,
+                stage_result_id = %continuation.result_id,
+                stage_run_id = %continuation.source_stage_run_id,
+                claim_token = %token,
+                "Failed to apply project status stage continuation"
+            );
+            if let Err(release_error) = ProjectStatusStageContinuation::release_claim(
+                &deployment.db().pool,
+                continuation.id,
+                token,
+            )
+            .await
+            {
+                tracing::error!(
+                    %release_error,
+                    continuation_id = %continuation.id,
+                    claim_token = %token,
+                    "Failed to release errored project status continuation claim"
+                );
+            }
         }
     }
 
     for stage_run in
-        ProjectStatusStageRun::list_pending_on_enter_for_active_workflows(&deployment.db().pool)
-            .await?
+        ProjectStatusStageRun::list_restartable_pending_on_enter(&deployment.db().pool).await?
     {
         let input_result_id = match stage_run.workflow_run_id {
             Some(workflow_run_id) => {
@@ -202,7 +259,21 @@ async fn process_workflow_continuations_once(deployment: &DeploymentImpl) -> Res
             }
             None => stage_run.workspace_id,
         };
-        start_stage_run(deployment, stage_run.id, workspace_id, input_result_id).await?;
+        if let Err(error) =
+            start_stage_run(deployment, stage_run.id, workspace_id, input_result_id).await
+        {
+            tracing::error!(
+                %error,
+                remote_project_id = %stage_run.remote_project_id,
+                issue_id = %stage_run.issue_id,
+                project_status_id = %stage_run.project_status_id,
+                status_entry_id = %stage_run.status_entry_id,
+                stage_run_id = %stage_run.id,
+                workflow_run_id = ?stage_run.workflow_run_id,
+                input_result_id = ?input_result_id,
+                "Failed to restart pending project status stage"
+            );
+        }
     }
 
     Ok(())
@@ -220,18 +291,33 @@ async fn prepare_stage_continuation(
     let Some(workflow_run_id) = stage_run.workflow_run_id else {
         return Ok(());
     };
+    let is_current_attempt = ProjectStatusStageAttempt::is_latest_for_stage_run(
+        &deployment.db().pool,
+        stage_run.id,
+        result.attempt_id,
+    )
+    .await?;
     let workflow =
         ProjectStatusWorkflowRun::find_by_id(&deployment.db().pool, workflow_run_id).await?;
-    let substantive_output = result.has_substantive_output(&deployment.db().pool).await?;
-    let (status, target_status_id, error_code, error_message) = continuation_decision(
-        result.outcome,
-        substantive_output,
-        stage_run.completion_mode,
-        stage_run.next_status_id,
-        workflow.as_ref().map(|workflow| workflow.status),
-    );
+    let (status, target_status_id, error_code, error_message) = if is_current_attempt {
+        let substantive_output = result.has_substantive_output(&deployment.db().pool).await?;
+        continuation_decision(
+            result.outcome,
+            substantive_output,
+            stage_run.completion_mode,
+            stage_run.next_status_id,
+            workflow.as_ref().map(|workflow| workflow.status),
+        )
+    } else {
+        (
+            StageContinuationStatus::Superseded,
+            None,
+            Some("stale_attempt".to_string()),
+            Some("A newer retry superseded this stage result".to_string()),
+        )
+    };
 
-    ProjectStatusStageContinuation::create(
+    let continuation = ProjectStatusStageContinuation::create(
         &deployment.db().pool,
         &NewStageContinuation {
             result_id: result.id,
@@ -245,41 +331,82 @@ async fn prepare_stage_continuation(
         },
     )
     .await?;
+    tracing::info!(
+        remote_project_id = %result.remote_project_id,
+        issue_id = %result.issue_id,
+        project_status_id = %result.project_status_id,
+        status_entry_id = %result.status_entry_id,
+        stage_run_id = %result.stage_run_id,
+        stage_attempt_id = %result.attempt_id,
+        stage_result_id = %result.id,
+        continuation_id = %continuation.id,
+        workflow_run_id = %workflow_run_id,
+        outcome = ?result.outcome,
+        continuation_status = ?status,
+        "Prepared project status stage continuation"
+    );
 
     match status {
         StageContinuationStatus::Stayed => {
-            ProjectStatusWorkflowRun::set_status(
+            if !ProjectStatusWorkflowRun::set_status_if_current_attempt(
                 &deployment.db().pool,
                 workflow_run_id,
+                stage_run.id,
+                result.attempt_id,
                 WorkflowRunStatus::Completed,
                 None,
                 None,
             )
-            .await?;
+            .await?
+            {
+                ProjectStatusStageContinuation::mark_stale_attempt(
+                    &deployment.db().pool,
+                    continuation.id,
+                )
+                .await?;
+            }
         }
         StageContinuationStatus::Ineligible
             if workflow
                 .as_ref()
                 .is_some_and(|workflow| workflow.status != WorkflowRunStatus::Paused) =>
         {
-            ProjectStatusWorkflowRun::set_status(
+            if !ProjectStatusWorkflowRun::set_status_if_current_attempt(
                 &deployment.db().pool,
                 workflow_run_id,
+                stage_run.id,
+                result.attempt_id,
                 WorkflowRunStatus::AwaitingManual,
                 error_code.as_deref(),
                 error_message.as_deref(),
             )
-            .await?;
+            .await?
+            {
+                ProjectStatusStageContinuation::mark_stale_attempt(
+                    &deployment.db().pool,
+                    continuation.id,
+                )
+                .await?;
+            }
         }
         StageContinuationStatus::Paused => {
-            ProjectStatusWorkflowRun::set_status(
+            if !ProjectStatusWorkflowRun::set_status_if_current_attempt(
                 &deployment.db().pool,
                 workflow_run_id,
+                stage_run.id,
+                result.attempt_id,
                 WorkflowRunStatus::Paused,
                 error_code.as_deref(),
                 error_message.as_deref(),
             )
-            .await?;
+            .await?
+            {
+                ProjectStatusStageContinuation::mark_stale_attempt(
+                    &deployment.db().pool,
+                    continuation.id,
+                )
+                .await?;
+            }
         }
         _ => {}
     }
@@ -355,6 +482,7 @@ fn continuation_decision(
 async fn apply_stage_continuation(
     deployment: &DeploymentImpl,
     continuation_id: Uuid,
+    claim_token: Uuid,
 ) -> Result<(), ApiError> {
     let Some(continuation) =
         ProjectStatusStageContinuation::find_by_id(&deployment.db().pool, continuation_id).await?
@@ -366,6 +494,7 @@ async fn apply_stage_continuation(
             &deployment.db().pool,
             continuation.id,
             continuation.workflow_run_id,
+            claim_token,
             "target_status_missing",
             "The configured target status is missing",
         )
@@ -380,6 +509,7 @@ async fn apply_stage_continuation(
                 &deployment.db().pool,
                 continuation.id,
                 continuation.workflow_run_id,
+                claim_token,
                 "remote_unavailable",
                 &error.to_string(),
             )
@@ -406,6 +536,7 @@ async fn apply_stage_continuation(
                 &deployment.db().pool,
                 continuation.id,
                 continuation.workflow_run_id,
+                claim_token,
                 "target_validation_failed",
                 &error.to_string(),
             )
@@ -421,6 +552,7 @@ async fn apply_stage_continuation(
             &deployment.db().pool,
             continuation.id,
             continuation.workflow_run_id,
+            claim_token,
             "target_status_unavailable",
             "The configured target status was deleted or hidden",
         )
@@ -438,6 +570,7 @@ async fn apply_stage_continuation(
                 &deployment.db().pool,
                 continuation.id,
                 continuation.workflow_run_id,
+                claim_token,
                 "issue_load_failed",
                 &error.to_string(),
             )
@@ -451,6 +584,7 @@ async fn apply_stage_continuation(
             &deployment.db().pool,
             continuation.id,
             continuation.workflow_run_id,
+            claim_token,
             "target_status_mismatch",
             "The configured target status belongs to another project",
         )
@@ -458,13 +592,72 @@ async fn apply_stage_continuation(
         return Ok(());
     }
 
+    let source_stage_run =
+        ProjectStatusStageRun::find_by_id(&deployment.db().pool, continuation.source_stage_run_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Source stage run not found".to_string()))?;
+    let source_entry =
+        ProjectStatusEntry::find_by_id(&deployment.db().pool, source_stage_run.status_entry_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Source status entry not found".to_string()))?;
+    if source_entry.project_status_id != continuation.source_status_id {
+        ProjectStatusStageContinuation::mark_superseded(
+            &deployment.db().pool,
+            continuation.id,
+            continuation.workflow_run_id,
+            claim_token,
+            "The source status entry no longer matches this continuation",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let owns_remote_transition = issue.status_id == target_status_id
+        && continuation.remote_issue_updated_at.as_ref() == Some(&issue.updated_at);
+    if issue.status_id == target_status_id && !owns_remote_transition {
+        ProjectStatusStageContinuation::pause_with_error(
+            &deployment.db().pool,
+            continuation.id,
+            continuation.workflow_run_id,
+            claim_token,
+            "transition_ownership_ambiguous",
+            "The issue reached the target status without a durable transition checkpoint; verify it manually",
+        )
+        .await?;
+        return Ok(());
+    }
+
     if issue.status_id != target_status_id {
+        if source_entry.exited_at.is_some() {
+            ProjectStatusStageContinuation::mark_superseded(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                claim_token,
+                "The source status entry is no longer active",
+            )
+            .await?;
+            return Ok(());
+        }
         if issue.status_id != continuation.source_status_id {
             ProjectStatusStageContinuation::mark_superseded(
                 &deployment.db().pool,
                 continuation.id,
                 continuation.workflow_run_id,
+                claim_token,
                 "The issue left the source status before automation could advance it",
+            )
+            .await?;
+            return Ok(());
+        }
+        if issue.updated_at != source_entry.issue_updated_at {
+            ProjectStatusStageContinuation::pause_with_error(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                claim_token,
+                "source_entry_ambiguous",
+                "The source issue changed after this status entry was recorded; verify the status manually",
             )
             .await?;
             return Ok(());
@@ -480,6 +673,16 @@ async fn apply_stage_continuation(
             return Ok(());
         }
 
+        if !ProjectStatusStageContinuation::is_claim_owner(
+            &deployment.db().pool,
+            continuation.id,
+            claim_token,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
         issue = match client
             .update_issue(issue.id, &status_update_request(target_status_id))
             .await
@@ -490,6 +693,7 @@ async fn apply_stage_continuation(
                     &deployment.db().pool,
                     continuation.id,
                     continuation.workflow_run_id,
+                    claim_token,
                     "status_transition_failed",
                     &error.to_string(),
                 )
@@ -497,12 +701,43 @@ async fn apply_stage_continuation(
                 return Ok(());
             }
         };
+        if issue.status_id != target_status_id {
+            ProjectStatusStageContinuation::pause_with_error(
+                &deployment.db().pool,
+                continuation.id,
+                continuation.workflow_run_id,
+                claim_token,
+                "status_transition_mismatch",
+                "The remote service did not return the requested target status",
+            )
+            .await?;
+            return Ok(());
+        }
+        if !ProjectStatusStageContinuation::record_remote_transition(
+            &deployment.db().pool,
+            continuation.id,
+            claim_token,
+            issue.updated_at,
+        )
+        .await?
+        {
+            return Ok(());
+        }
     }
 
     let result =
         ProjectStatusStageResult::find_by_id(&deployment.db().pool, continuation.result_id)
             .await?
             .ok_or_else(|| ApiError::BadRequest("Stage result not found".to_string()))?;
+    if !ProjectStatusStageContinuation::is_claim_owner(
+        &deployment.db().pool,
+        continuation.id,
+        claim_token,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let target_automation =
         ProjectStatusAutomation::find(&deployment.db().pool, issue.project_id, target_status_id)
             .await?
@@ -518,12 +753,31 @@ async fn apply_stage_continuation(
     .await
     .map_err(stage_run_error_to_api)?;
 
-    ProjectStatusStageContinuation::mark_advanced(
+    let claim_committed = ProjectStatusStageContinuation::mark_advanced(
         &deployment.db().pool,
         continuation.id,
+        claim_token,
         issue.updated_at,
     )
     .await?;
+    if !claim_committed {
+        return Ok(());
+    }
+    tracing::info!(
+        remote_project_id = %result.remote_project_id,
+        issue_id = %result.issue_id,
+        project_status_id = %result.project_status_id,
+        status_entry_id = %result.status_entry_id,
+        stage_run_id = %result.stage_run_id,
+        stage_attempt_id = %result.attempt_id,
+        stage_result_id = %result.id,
+        continuation_id = %continuation.id,
+        workflow_run_id = %continuation.workflow_run_id,
+        source_status_id = %continuation.source_status_id,
+        target_status_id = %target_status_id,
+        remote_issue_updated_at = %issue.updated_at,
+        "Advanced project status stage continuation"
+    );
 
     if let Some(entry) = outcome.entry {
         deployment
@@ -536,18 +790,11 @@ async fn apply_stage_continuation(
             .events()
             .msg_store()
             .push_patch(project_status_stage_run_patch::add(&stage_run));
-        let workflow_is_active = ProjectStatusWorkflowRun::find_by_id(
-            &deployment.db().pool,
-            continuation.workflow_run_id,
-        )
-        .await?
-        .is_some_and(|workflow| workflow.status == WorkflowRunStatus::Active);
-        if workflow_is_active
-            && target_automation
-                .as_ref()
-                .is_some_and(|automation| automation.start_mode == AutomationStartMode::Manual)
+        if target_automation
+            .as_ref()
+            .is_some_and(|automation| automation.start_mode == AutomationStartMode::Manual)
         {
-            ProjectStatusWorkflowRun::set_status(
+            ProjectStatusWorkflowRun::set_status_if_active(
                 &deployment.db().pool,
                 continuation.workflow_run_id,
                 WorkflowRunStatus::AwaitingManual,
@@ -555,7 +802,7 @@ async fn apply_stage_continuation(
                 None,
             )
             .await?;
-        } else if workflow_is_active && outcome.should_start {
+        } else if outcome.should_start {
             start_stage_run(
                 deployment,
                 stage_run.id,
@@ -565,7 +812,7 @@ async fn apply_stage_continuation(
             .await?;
         }
     } else {
-        ProjectStatusWorkflowRun::set_status(
+        ProjectStatusWorkflowRun::set_status_if_active(
             &deployment.db().pool,
             continuation.workflow_run_id,
             WorkflowRunStatus::Completed,
@@ -651,6 +898,14 @@ async fn observe_issue_statuses(
     }
 
     for stage_run_id in starts {
+        if !automation_runtime_enabled() {
+            tracing::info!(
+                %stage_run_id,
+                environment_variable = AUTOMATION_DISABLED_ENV,
+                "Skipped automatic stage start because automation is disabled"
+            );
+            continue;
+        }
         let deployment = deployment.clone();
         tokio::spawn(async move {
             if let Err(error) = start_stage_run(&deployment, stage_run_id, None, None).await {
@@ -782,6 +1037,11 @@ async fn start_stage_run(
     requested_workspace_id: Option<Uuid>,
     requested_input_result_id: Option<Uuid>,
 ) -> Result<ProjectStatusStageRun, ApiError> {
+    if !automation_runtime_enabled() {
+        return Err(ApiError::BadRequest(format!(
+            "Project status automation is disabled by {AUTOMATION_DISABLED_ENV}"
+        )));
+    }
     let stage_run =
         match ProjectStatusStageRun::claim_start(&deployment.db().pool, stage_run_id).await {
             Ok(stage_run) => stage_run,
@@ -797,6 +1057,18 @@ async fn start_stage_run(
         ProjectStatusStageAttempt::latest_for_stage_run(&deployment.db().pool, stage_run_id)
             .await?
             .ok_or_else(|| ApiError::BadRequest("Stage attempt was not created".to_string()))?;
+    tracing::info!(
+        remote_project_id = %stage_run.remote_project_id,
+        issue_id = %stage_run.issue_id,
+        project_status_id = %stage_run.project_status_id,
+        status_entry_id = %stage_run.status_entry_id,
+        stage_run_id = %stage_run.id,
+        stage_attempt_id = %attempt.id,
+        attempt_number = attempt.attempt_number,
+        workflow_run_id = ?stage_run.workflow_run_id,
+        trigger = ?stage_run.trigger,
+        "Claimed project status stage attempt"
+    );
 
     if let Err(failure) = start_claimed_stage_run(
         deployment,
@@ -813,25 +1085,37 @@ async fn start_stage_run(
             error = %failure.message,
             "Project status stage could not be started"
         );
-        ProjectStatusStageRun::mark_start_failed(
+        let updated = ProjectStatusStageRun::mark_start_failed(
             &deployment.db().pool,
             stage_run_id,
+            attempt.id,
             failure.code,
             &failure.message,
         )
         .await?;
-        let repositories = start_failure_repository_inputs(deployment, attempt.id).await?;
-        ProjectStatusStageResult::materialize_for_attempt(
-            &deployment.db().pool,
-            attempt.id,
-            &repositories,
-        )
-        .await?;
+        if updated {
+            let repositories = start_failure_repository_inputs(deployment, attempt.id).await?;
+            ProjectStatusStageResult::materialize_for_attempt(
+                &deployment.db().pool,
+                attempt.id,
+                &repositories,
+            )
+            .await?;
+        }
     }
 
     ProjectStatusStageRun::find_by_id(&deployment.db().pool, stage_run_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("Stage run not found".to_string()))
+}
+
+fn automation_runtime_enabled() -> bool {
+    !std::env::var(AUTOMATION_DISABLED_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 async fn start_claimed_stage_run(
@@ -947,6 +1231,7 @@ async fn start_claimed_stage_run(
         deployment,
         &client,
         stage_run,
+        attempt,
         &entry,
         requested_workspace_id.or(handoff_workspace_id),
     )
@@ -965,9 +1250,14 @@ async fn start_claimed_stage_run(
         ));
     }
 
-    ProjectStatusStageRun::assign_workspace(&deployment.db().pool, stage_run.id, workspace.id)
-        .await
-        .map_err(database_start_failure)?;
+    ProjectStatusStageRun::assign_workspace(
+        &deployment.db().pool,
+        stage_run.id,
+        attempt.id,
+        workspace.id,
+    )
+    .await
+    .map_err(database_start_failure)?;
 
     let handoff = match explicit_handoff {
         Some(result) => Some(result),
@@ -1031,11 +1321,18 @@ async fn start_claimed_stage_run(
     let start_result = if is_new {
         deployment
             .container()
-            .start_workspace_for_stage(&workspace, executor_config, prompt, Some(stage_run.id))
+            .start_workspace_for_stage(&workspace, executor_config, prompt, Some(attempt.id))
             .await
     } else {
-        start_in_existing_workspace(deployment, stage_run, &workspace, executor_config, prompt)
-            .await
+        start_in_existing_workspace(
+            deployment,
+            stage_run,
+            attempt,
+            &workspace,
+            executor_config,
+            prompt,
+        )
+        .await
     };
 
     start_result
@@ -1047,6 +1344,7 @@ async fn resolve_workspace(
     deployment: &DeploymentImpl,
     client: &RemoteClient,
     stage_run: &ProjectStatusStageRun,
+    attempt: &ProjectStatusStageAttempt,
     entry: &ProjectStatusEntry,
     requested_workspace_id: Option<Uuid>,
 ) -> Result<(Workspace, bool), StageStartFailure> {
@@ -1120,13 +1418,14 @@ async fn resolve_workspace(
         }
     }
 
-    create_automation_workspace(deployment, client, stage_run, entry).await
+    create_automation_workspace(deployment, client, stage_run, attempt, entry).await
 }
 
 async fn create_automation_workspace(
     deployment: &DeploymentImpl,
     client: &RemoteClient,
     stage_run: &ProjectStatusStageRun,
+    attempt: &ProjectStatusStageAttempt,
     entry: &ProjectStatusEntry,
 ) -> Result<(Workspace, bool), StageStartFailure> {
     let scratch = Scratch::find_by_id(
@@ -1169,9 +1468,14 @@ async fn create_automation_workspace(
             .map_err(|error| StageStartFailure::new("workspace_setup_failed", error.to_string()))?;
     }
     let workspace = managed_workspace.workspace.clone();
-    ProjectStatusStageRun::assign_workspace(&deployment.db().pool, stage_run.id, workspace.id)
-        .await
-        .map_err(database_start_failure)?;
+    ProjectStatusStageRun::assign_workspace(
+        &deployment.db().pool,
+        stage_run.id,
+        attempt.id,
+        workspace.id,
+    )
+    .await
+    .map_err(database_start_failure)?;
     link_automation_workspace(client, stage_run, &workspace).await?;
     Ok((workspace, true))
 }
@@ -1201,6 +1505,7 @@ async fn link_automation_workspace(
 async fn start_in_existing_workspace(
     deployment: &DeploymentImpl,
     stage_run: &ProjectStatusStageRun,
+    attempt: &ProjectStatusStageAttempt,
     workspace: &Workspace,
     executor_config: ExecutorConfig,
     prompt: String,
@@ -1272,7 +1577,7 @@ async fn start_in_existing_workspace(
             &session,
             &action,
             &ExecutionProcessRunReason::CodingAgent,
-            Some(stage_run.id),
+            Some(attempt.id),
         )
         .await
 }

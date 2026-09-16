@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BINARY_PATH__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BACKEND_PORT</key>
+    <string>__BACKEND_PORT__</string>
+    <key>PREVIEW_PROXY_PORT</key>
+    <string>__PREVIEW_PROXY_PORT__</string>
+    <key>HOST</key>
+    <string>127.0.0.1</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>VIBE_KANBAN_DATA_DIR</key>
+    <string>__DATA_DIR__</string>
+    <key>VIBE_KANBAN_INSTANCE_ID</key>
+    <string>__INSTANCE_ID__</string>
+    <key>VIBE_KANBAN_AUTOMATION_DISABLED</key>
+    <string>__AUTOMATION_DISABLED__</string>
+    <key>VIBE_KANBAN_OPEN_BROWSER</key>
+    <string>0</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/stderr.log</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

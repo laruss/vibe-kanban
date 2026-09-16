@@ -83,7 +83,7 @@ pub struct NewStageContinuation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContinuationClaimOutcome {
-    Claimed,
+    Claimed { token: Uuid },
     NotPending,
     WorkflowNotActive,
     BudgetExhausted,
@@ -135,6 +135,7 @@ struct StageContinuationRow {
     error_message: Option<String>,
     remote_issue_updated_at: Option<DateTime<Utc>>,
     claimed_at: Option<DateTime<Utc>>,
+    claim_token: Option<Uuid>,
     completed_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -290,6 +291,7 @@ impl ProjectStatusWorkflowRun {
             r#"UPDATE project_status_stage_continuations
                SET status = 'superseded', error_code = 'manual_status_change',
                    error_message = 'The issue was moved manually',
+                   claim_token = NULL,
                    completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
                WHERE workflow_run_id IN (
@@ -333,6 +335,71 @@ impl ProjectStatusWorkflowRun {
         Ok(())
     }
 
+    pub async fn set_status_if_current_attempt(
+        pool: &SqlitePool,
+        id: Uuid,
+        stage_run_id: Uuid,
+        attempt_id: Uuid,
+        status: WorkflowRunStatus,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let completed = matches!(
+            status,
+            WorkflowRunStatus::Completed | WorkflowRunStatus::Superseded
+        );
+        let updated = sqlx::query(
+            r#"UPDATE project_status_workflow_runs
+               SET status = ?, error_code = ?, error_message = ?,
+                   completed_at = CASE WHEN ? THEN datetime('now', 'subsec') ELSE NULL END,
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ?
+                 AND ? = (
+                     SELECT latest.id FROM project_status_stage_attempts latest
+                     WHERE latest.stage_run_id = ?
+                     ORDER BY latest.attempt_number DESC LIMIT 1
+                 )"#,
+        )
+        .bind(status.as_str())
+        .bind(error_code)
+        .bind(error_message)
+        .bind(completed)
+        .bind(id)
+        .bind(attempt_id)
+        .bind(stage_run_id)
+        .execute(pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn set_status_if_active(
+        pool: &SqlitePool,
+        id: Uuid,
+        status: WorkflowRunStatus,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let completed = matches!(
+            status,
+            WorkflowRunStatus::Completed | WorkflowRunStatus::Superseded
+        );
+        let updated = sqlx::query(
+            r#"UPDATE project_status_workflow_runs
+               SET status = ?, error_code = ?, error_message = ?,
+                   completed_at = CASE WHEN ? THEN datetime('now', 'subsec') ELSE NULL END,
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ? AND status = 'active'"#,
+        )
+        .bind(status.as_str())
+        .bind(error_code)
+        .bind(error_message)
+        .bind(completed)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     pub async fn pause_latest(
         pool: &SqlitePool,
         remote_project_id: Uuid,
@@ -367,6 +434,7 @@ impl ProjectStatusWorkflowRun {
             r#"UPDATE project_status_stage_continuations
                SET status = 'paused', error_code = 'paused_by_user',
                    error_message = 'Automation was paused by the user',
+                   claim_token = NULL,
                    completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
                WHERE workflow_run_id = ? AND status IN ('pending', 'applying')"#,
@@ -436,7 +504,7 @@ impl ProjectStatusWorkflowRun {
         sqlx::query(
             r#"UPDATE project_status_stage_continuations
                SET status = 'pending', error_code = NULL, error_message = NULL,
-                   claimed_at = NULL, completed_at = NULL,
+                   claimed_at = NULL, claim_token = NULL, completed_at = NULL,
                    updated_at = datetime('now', 'subsec')
                WHERE workflow_run_id = ? AND status = 'paused'"#,
         )
@@ -457,7 +525,7 @@ impl ProjectStatusStageContinuation {
             r#"SELECT id, result_id, workflow_run_id, source_stage_run_id,
                       source_status_id, target_status_id, status, budget_reserved,
                       error_code, error_message, remote_issue_updated_at,
-                      claimed_at, completed_at, created_at, updated_at
+                      claimed_at, claim_token, completed_at, created_at, updated_at
                FROM project_status_stage_continuations WHERE {predicate}"#
         )
     }
@@ -596,6 +664,38 @@ impl ProjectStatusStageContinuation {
             return Ok(ContinuationClaimOutcome::WorkflowNotActive);
         }
 
+        let latest_attempt = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM project_status_stage_results result
+                   JOIN project_status_stage_attempts attempt ON attempt.id = result.attempt_id
+                   WHERE result.id = ?
+                     AND attempt.id = (
+                         SELECT latest.id FROM project_status_stage_attempts latest
+                         WHERE latest.stage_run_id = attempt.stage_run_id
+                         ORDER BY latest.attempt_number DESC LIMIT 1
+                     )
+               )"#,
+        )
+        .bind(row.result_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !latest_attempt {
+            sqlx::query(
+                r#"UPDATE project_status_stage_continuations
+                   SET status = 'superseded', error_code = 'stale_attempt',
+                       error_message = 'A newer retry superseded this stage result',
+                       completed_at = datetime('now', 'subsec'),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = ? AND status = 'pending'"#,
+            )
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(ContinuationClaimOutcome::NotPending);
+        }
+
         if !row.budget_reserved {
             let reserved = sqlx::query(
                 r#"UPDATE project_status_workflow_runs
@@ -622,6 +722,7 @@ impl ProjectStatusStageContinuation {
                     r#"UPDATE project_status_stage_continuations
                        SET status = 'paused', error_code = 'transition_budget_exhausted',
                            error_message = 'The automatic transition budget was exhausted',
+                           claim_token = NULL,
                            completed_at = datetime('now', 'subsec'),
                            updated_at = datetime('now', 'subsec')
                        WHERE id = ? AND status = 'pending'"#,
@@ -634,122 +735,207 @@ impl ProjectStatusStageContinuation {
             }
         }
 
+        let token = Uuid::new_v4();
         let claimed = sqlx::query(
             r#"UPDATE project_status_stage_continuations
                SET status = 'applying', budget_reserved = 1,
-                   claimed_at = datetime('now', 'subsec'),
+                   claimed_at = datetime('now', 'subsec'), claim_token = ?,
                    updated_at = datetime('now', 'subsec')
                WHERE id = ? AND status = 'pending'"#,
         )
+        .bind(token)
         .bind(id)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
         Ok(if claimed.rows_affected() == 1 {
-            ContinuationClaimOutcome::Claimed
+            ContinuationClaimOutcome::Claimed { token }
         } else {
             ContinuationClaimOutcome::NotPending
         })
     }
 
-    pub async fn requeue_stale_claims(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    pub async fn requeue_interrupted_claims(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+        let updated = sqlx::query(
             r#"UPDATE project_status_stage_continuations
-               SET status = 'pending', claimed_at = NULL,
+               SET status = 'pending', claimed_at = NULL, claim_token = NULL,
                    updated_at = datetime('now', 'subsec')
-               WHERE status = 'applying'
-                 AND updated_at <= datetime('now', '-30 seconds')"#,
+               WHERE status = 'applying'"#,
         )
         .execute(pool)
         .await?;
-        Ok(())
+        Ok(updated.rows_affected())
+    }
+
+    pub async fn release_claim(
+        pool: &SqlitePool,
+        id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query(
+            r#"UPDATE project_status_stage_continuations
+               SET status = 'pending', claimed_at = NULL, claim_token = NULL,
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ? AND status = 'applying' AND claim_token = ?"#,
+        )
+        .bind(id)
+        .bind(claim_token)
+        .execute(pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn is_claim_owner(
+        pool: &SqlitePool,
+        id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM project_status_stage_continuations
+                   WHERE id = ? AND status = 'applying' AND claim_token = ?
+               )"#,
+        )
+        .bind(id)
+        .bind(claim_token)
+        .fetch_one(pool)
+        .await
     }
 
     pub async fn mark_advanced(
         pool: &SqlitePool,
         id: Uuid,
+        claim_token: Uuid,
         remote_issue_updated_at: DateTime<Utc>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query(
             r#"UPDATE project_status_stage_continuations
                SET status = 'advanced', remote_issue_updated_at = ?,
                    error_code = NULL, error_message = NULL,
+                   claim_token = NULL,
                    completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
-               WHERE id = ? AND status = 'applying'"#,
+               WHERE id = ? AND status = 'applying' AND claim_token = ?"#,
         )
         .bind(remote_issue_updated_at)
         .bind(id)
+        .bind(claim_token)
         .execute(pool)
         .await?;
-        Ok(())
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn record_remote_transition(
+        pool: &SqlitePool,
+        id: Uuid,
+        claim_token: Uuid,
+        remote_issue_updated_at: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query(
+            r#"UPDATE project_status_stage_continuations
+               SET remote_issue_updated_at = ?,
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ? AND status = 'applying' AND claim_token = ?"#,
+        )
+        .bind(remote_issue_updated_at)
+        .bind(id)
+        .bind(claim_token)
+        .execute(pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     pub async fn pause_with_error(
         pool: &SqlitePool,
         id: Uuid,
         workflow_run_id: Uuid,
+        claim_token: Uuid,
         code: &str,
         message: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
+        let continuation = sqlx::query(
             r#"UPDATE project_status_stage_continuations
                SET status = 'paused', error_code = ?, error_message = ?,
+                   claim_token = NULL,
                    completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
-               WHERE id = ? AND status IN ('pending', 'applying')"#,
+               WHERE id = ? AND status = 'applying' AND claim_token = ?"#,
         )
         .bind(code)
         .bind(message)
         .bind(id)
+        .bind(claim_token)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
-            r#"UPDATE project_status_workflow_runs
-               SET status = 'paused', error_code = ?, error_message = ?,
-                   updated_at = datetime('now', 'subsec')
-               WHERE id = ? AND status IN ('active', 'awaiting_manual')"#,
-        )
-        .bind(code)
-        .bind(message)
-        .bind(workflow_run_id)
-        .execute(&mut *transaction)
-        .await?;
+        if continuation.rows_affected() == 1 {
+            sqlx::query(
+                r#"UPDATE project_status_workflow_runs
+                   SET status = 'paused', error_code = ?, error_message = ?,
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = ? AND status IN ('active', 'awaiting_manual')"#,
+            )
+            .bind(code)
+            .bind(message)
+            .bind(workflow_run_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
-        Ok(())
+        Ok(continuation.rows_affected() == 1)
     }
 
     pub async fn mark_superseded(
         pool: &SqlitePool,
         id: Uuid,
         workflow_run_id: Uuid,
+        claim_token: Uuid,
         message: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
+        let continuation = sqlx::query(
             r#"UPDATE project_status_stage_continuations
                SET status = 'superseded', error_code = 'status_changed',
-                   error_message = ?, completed_at = datetime('now', 'subsec'),
+                   error_message = ?, claim_token = NULL,
+                   completed_at = datetime('now', 'subsec'),
                    updated_at = datetime('now', 'subsec')
-               WHERE id = ? AND status IN ('pending', 'applying', 'paused')"#,
+               WHERE id = ? AND status = 'applying' AND claim_token = ?"#,
         )
         .bind(message)
         .bind(id)
+        .bind(claim_token)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query(
-            r#"UPDATE project_status_workflow_runs
-               SET status = 'superseded', error_code = 'status_changed',
-                   error_message = ?, completed_at = datetime('now', 'subsec'),
-                   updated_at = datetime('now', 'subsec')
-               WHERE id = ? AND status IN ('active', 'paused', 'awaiting_manual')"#,
-        )
-        .bind(message)
-        .bind(workflow_run_id)
-        .execute(&mut *transaction)
-        .await?;
+        if continuation.rows_affected() == 1 {
+            sqlx::query(
+                r#"UPDATE project_status_workflow_runs
+                   SET status = 'superseded', error_code = 'status_changed',
+                       error_message = ?, completed_at = datetime('now', 'subsec'),
+                       updated_at = datetime('now', 'subsec')
+                   WHERE id = ? AND status IN ('active', 'paused', 'awaiting_manual')"#,
+            )
+            .bind(message)
+            .bind(workflow_run_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
+        Ok(continuation.rows_affected() == 1)
+    }
+
+    pub async fn mark_stale_attempt(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"UPDATE project_status_stage_continuations
+               SET status = 'superseded', error_code = 'stale_attempt',
+                   error_message = 'A newer retry superseded this stage result',
+                   claim_token = NULL,
+                   completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ? AND status != 'advanced'"#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
@@ -827,6 +1013,7 @@ impl TryFrom<StageContinuationRow> for ProjectStatusStageContinuation {
     type Error = sqlx::Error;
 
     fn try_from(row: StageContinuationRow) -> Result<Self, Self::Error> {
+        let _ = row.claim_token;
         Ok(Self {
             id: row.id,
             result_id: row.result_id,
@@ -884,11 +1071,12 @@ fn invalid_data(message: String) -> sqlx::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
     use chrono::{Duration, Utc};
     use executors::{executors::BaseCodingAgent, profile::ExecutorProfileId};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tokio::sync::Barrier;
     use uuid::Uuid;
 
     use super::{
@@ -900,9 +1088,12 @@ mod tests {
             AutomationCompletionMode, AutomationSessionMode, AutomationStartMode,
             ProjectStatusAutomation,
         },
-        project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
+        project_status_stage_result::{
+            ProjectStatusStageAttempt, ProjectStatusStageResult, StageResultRepositoryInput,
+        },
         project_status_stage_run::{
-            IssueStatusObservation, ProjectStatusEntry, ProjectStatusStageRun,
+            IssueStatusObservation, ProjectStatusEntry, ProjectStatusStageRun, StageRunStatus,
+            StageRunTrigger,
         },
     };
 
@@ -972,6 +1163,7 @@ mod tests {
         ProjectStatusStageRun::mark_start_failed(
             pool,
             stage_run_id,
+            attempt.id,
             "test_failure",
             "failed for test",
         )
@@ -981,6 +1173,66 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// Completes one stage with fixed repository output, modelling the
+    /// deterministic QA executor without invoking an external agent process.
+    async fn mock_executor_success(
+        pool: &sqlx::SqlitePool,
+        stage_run_id: Uuid,
+        workspace_id: Uuid,
+        input_result_id: Option<Uuid>,
+        repo_id: Uuid,
+        commit: &str,
+    ) -> ProjectStatusStageResult {
+        ProjectStatusStageRun::claim_start(pool, stage_run_id)
+            .await
+            .unwrap();
+        let attempt = ProjectStatusStageAttempt::latest_for_stage_run(pool, stage_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectStatusStageRun::assign_workspace(pool, stage_run_id, attempt.id, workspace_id)
+            .await
+            .unwrap();
+        ProjectStatusStageAttempt::set_input_result(pool, attempt.id, input_result_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"UPDATE project_status_stage_attempts
+               SET status = 'completed', completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ?"#,
+        )
+        .bind(attempt.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE project_status_stage_runs
+               SET status = 'completed', completed_at = datetime('now', 'subsec'),
+                   updated_at = datetime('now', 'subsec')
+               WHERE id = ?"#,
+        )
+        .bind(stage_run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        ProjectStatusStageResult::materialize_for_attempt(
+            pool,
+            attempt.id,
+            &[StageResultRepositoryInput {
+                repo_id,
+                repo_name: "workflow-repo".to_string(),
+                base_head_commit: Some("base".to_string()),
+                resulting_head_commit: Some(commit.to_string()),
+                uncommitted_changes_count: Some(0),
+                untracked_files_count: Some(0),
+            }],
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1096,12 +1348,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            ProjectStatusStageContinuation::claim(&pool, first.id)
-                .await
-                .unwrap(),
-            ContinuationClaimOutcome::Claimed
-        );
+        let first_claim_token = match ProjectStatusStageContinuation::claim(&pool, first.id)
+            .await
+            .unwrap()
+        {
+            ContinuationClaimOutcome::Claimed { token } => token,
+            outcome => panic!("expected claimed continuation, got {outcome:?}"),
+        };
         assert_eq!(
             ProjectStatusStageContinuation::claim(&pool, first.id)
                 .await
@@ -1109,9 +1362,14 @@ mod tests {
             ContinuationClaimOutcome::NotPending
         );
 
-        ProjectStatusStageContinuation::mark_advanced(&pool, first.id, Utc::now())
-            .await
-            .unwrap();
+        ProjectStatusStageContinuation::mark_advanced(
+            &pool,
+            first.id,
+            first_claim_token,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         let second_result = failed_attempt_result(&pool, stage_run.id).await;
         let second = ProjectStatusStageContinuation::create(
@@ -1145,12 +1403,12 @@ mod tests {
         ProjectStatusWorkflowRun::resume_latest(&pool, project_id, issue_id, Some(2))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             ProjectStatusStageContinuation::claim(&pool, second.id)
                 .await
                 .unwrap(),
-            ContinuationClaimOutcome::Claimed
-        );
+            ContinuationClaimOutcome::Claimed { .. }
+        ));
         let resumed = ProjectStatusWorkflowRun::find_by_id(&pool, workflow_run_id)
             .await
             .unwrap()
@@ -1289,6 +1547,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_workflow_blocks_stage_retry_until_resume() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+        let configured = automation(project_id, status_id, None, 3);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, status_id, Utc::now()),
+            Some(&configured),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        failed_attempt_result(&pool, stage_run.id).await;
+
+        ProjectStatusWorkflowRun::pause_latest(&pool, project_id, issue_id)
+            .await
+            .unwrap();
+        assert!(
+            ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+                .await
+                .is_err()
+        );
+
+        ProjectStatusWorkflowRun::resume_latest(&pool, project_id, issue_id, None)
+            .await
+            .unwrap();
+        assert!(
+            ProjectStatusStageRun::claim_start(&pool, stage_run.id)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn matching_automatic_status_observation_keeps_the_workflow_chain() {
         let pool = migrated_pool().await;
         let project_id = Uuid::new_v4();
@@ -1355,6 +1651,435 @@ mod tests {
                 .unwrap()
                 .status,
             WorkflowRunStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_mock_executor_three_status_workflow_reuses_workspace_and_handoffs() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let status_a = Uuid::new_v4();
+        let status_b = Uuid::new_v4();
+        let status_c = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let entered_at = Utc::now();
+
+        let mut automation_a = automation(project_id, status_a, Some(status_b), 5);
+        automation_a.start_mode = AutomationStartMode::OnEnter;
+        automation_a.executor_profile_id =
+            ExecutorProfileId::with_variant(BaseCodingAgent::Codex, "research".to_string());
+        let mut first_observation = observation(issue_id, status_a, entered_at);
+        first_observation.entered = true;
+        let stage_a =
+            ProjectStatusEntry::observe(&pool, project_id, &first_observation, Some(&automation_a))
+                .await
+                .unwrap()
+                .stage_run
+                .unwrap();
+        assert_eq!(stage_a.trigger, StageRunTrigger::OnEnter);
+        let result_a =
+            mock_executor_success(&pool, stage_a.id, workspace_id, None, repo_id, "commit-a").await;
+        let workflow_id = ProjectStatusStageRun::find_by_id(&pool, stage_a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workflow_run_id
+            .unwrap();
+        let continuation_a = ProjectStatusStageContinuation::create(
+            &pool,
+            &NewStageContinuation {
+                result_id: result_a.id,
+                workflow_run_id: workflow_id,
+                source_stage_run_id: stage_a.id,
+                source_status_id: status_a,
+                target_status_id: Some(status_b),
+                status: StageContinuationStatus::Pending,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+        let token_a = match ProjectStatusStageContinuation::claim(&pool, continuation_a.id)
+            .await
+            .unwrap()
+        {
+            ContinuationClaimOutcome::Claimed { token } => token,
+            outcome => panic!("expected first transition claim, got {outcome:?}"),
+        };
+
+        let mut automation_b = automation(project_id, status_b, Some(status_c), 5);
+        automation_b.start_mode = AutomationStartMode::OnEnter;
+        automation_b.session_mode = AutomationSessionMode::ContinueIfCompatible;
+        automation_b.executor_profile_id =
+            ExecutorProfileId::with_variant(BaseCodingAgent::Codex, "implementation".to_string());
+        let observation_b = observation(issue_id, status_b, entered_at + Duration::milliseconds(1));
+        let stage_b = ProjectStatusEntry::observe_in_workflow(
+            &pool,
+            project_id,
+            &observation_b,
+            Some(&automation_b),
+            workflow_id,
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        assert!(
+            ProjectStatusStageContinuation::mark_advanced(
+                &pool,
+                continuation_a.id,
+                token_a,
+                observation_b.issue_updated_at,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(stage_b.trigger, StageRunTrigger::OnEnter);
+        assert_eq!(stage_b.workflow_run_id, Some(workflow_id));
+        let result_b = mock_executor_success(
+            &pool,
+            stage_b.id,
+            workspace_id,
+            Some(result_a.id),
+            repo_id,
+            "commit-b",
+        )
+        .await;
+
+        let continuation_b = ProjectStatusStageContinuation::create(
+            &pool,
+            &NewStageContinuation {
+                result_id: result_b.id,
+                workflow_run_id: workflow_id,
+                source_stage_run_id: stage_b.id,
+                source_status_id: status_b,
+                target_status_id: Some(status_c),
+                status: StageContinuationStatus::Pending,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+        let token_b = match ProjectStatusStageContinuation::claim(&pool, continuation_b.id)
+            .await
+            .unwrap()
+        {
+            ContinuationClaimOutcome::Claimed { token } => token,
+            outcome => panic!("expected second transition claim, got {outcome:?}"),
+        };
+        let mut automation_c = automation(project_id, status_c, None, 5);
+        automation_c.executor_profile_id =
+            ExecutorProfileId::with_variant(BaseCodingAgent::Codex, "review".to_string());
+        let observation_c = observation(issue_id, status_c, entered_at + Duration::milliseconds(2));
+        let stage_c = ProjectStatusEntry::observe_in_workflow(
+            &pool,
+            project_id,
+            &observation_c,
+            Some(&automation_c),
+            workflow_id,
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        assert!(
+            ProjectStatusStageContinuation::mark_advanced(
+                &pool,
+                continuation_b.id,
+                token_b,
+                observation_c.issue_updated_at,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(stage_c.trigger, StageRunTrigger::Manual);
+
+        let replay = ProjectStatusEntry::observe_in_workflow(
+            &pool,
+            project_id,
+            &observation_c,
+            Some(&automation_c),
+            workflow_id,
+        )
+        .await
+        .unwrap();
+        assert!(replay.stage_run.is_none());
+        assert_eq!(replay.entry.unwrap().id, stage_c.status_entry_id);
+        assert_eq!(
+            ProjectStatusStageRun::list_by_issue(&pool, project_id, issue_id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|run| run.project_status_id == status_c)
+                .count(),
+            1
+        );
+
+        ProjectStatusWorkflowRun::set_status(
+            &pool,
+            workflow_id,
+            WorkflowRunStatus::AwaitingManual,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let result_c = mock_executor_success(
+            &pool,
+            stage_c.id,
+            workspace_id,
+            Some(result_b.id),
+            repo_id,
+            "commit-c",
+        )
+        .await;
+        let attempts_a = ProjectStatusStageAttempt::list_by_stage_run(&pool, stage_a.id)
+            .await
+            .unwrap();
+        let attempts_b = ProjectStatusStageAttempt::list_by_stage_run(&pool, stage_b.id)
+            .await
+            .unwrap();
+        let attempts_c = ProjectStatusStageAttempt::list_by_stage_run(&pool, stage_c.id)
+            .await
+            .unwrap();
+        assert_eq!(attempts_a[0].workspace_id, Some(workspace_id));
+        assert_eq!(attempts_b[0].workspace_id, Some(workspace_id));
+        assert_eq!(attempts_c[0].workspace_id, Some(workspace_id));
+        assert_eq!(attempts_b[0].input_result_id, Some(result_a.id));
+        assert_eq!(attempts_c[0].input_result_id, Some(result_b.id));
+        assert_eq!(result_c.workspace_id, Some(workspace_id));
+        assert_eq!(
+            attempts_a[0].executor_profile_id.variant.as_deref(),
+            Some("research")
+        );
+        assert_eq!(
+            attempts_b[0].executor_profile_id.variant.as_deref(),
+            Some("implementation")
+        );
+        assert_eq!(
+            attempts_c[0].executor_profile_id.variant.as_deref(),
+            Some("review")
+        );
+        assert!(
+            attempts_a
+                .iter()
+                .all(|attempt| attempt.status == StageRunStatus::Completed)
+        );
+        assert!(
+            attempts_b
+                .iter()
+                .all(|attempt| attempt.status == StageRunStatus::Completed)
+        );
+        assert!(
+            attempts_c
+                .iter()
+                .all(|attempt| attempt.status == StageRunStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_continuation_claims_reserve_budget_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(directory.path().join("continuation.sqlite"))
+            .create_if_missing(true)
+            .busy_timeout(StdDuration::from_secs(2));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::run_migrations(&pool).await.unwrap();
+
+        let project_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let source_status_id = Uuid::new_v4();
+        let target_status_id = Uuid::new_v4();
+        let configured = automation(project_id, source_status_id, Some(target_status_id), 2);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, source_status_id, Utc::now()),
+            Some(&configured),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        let result = failed_attempt_result(&pool, stage_run.id).await;
+        let stage_run = ProjectStatusStageRun::find_by_id(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let workflow_run_id = stage_run.workflow_run_id.unwrap();
+        let continuation = ProjectStatusStageContinuation::create(
+            &pool,
+            &NewStageContinuation {
+                result_id: result.id,
+                workflow_run_id,
+                source_stage_run_id: stage_run.id,
+                source_status_id,
+                target_status_id: Some(target_status_id),
+                status: StageContinuationStatus::Pending,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            let continuation_id = continuation.id;
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                ProjectStatusStageContinuation::claim(&pool, continuation_id).await
+            }));
+        }
+        barrier.wait().await;
+        let mut claimed = 0;
+        let mut skipped = 0;
+        for task in tasks {
+            match task.await.unwrap().unwrap() {
+                ContinuationClaimOutcome::Claimed { .. } => claimed += 1,
+                ContinuationClaimOutcome::NotPending => skipped += 1,
+                outcome => panic!("unexpected continuation claim outcome: {outcome:?}"),
+            }
+        }
+        assert_eq!(claimed, 1);
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            ProjectStatusWorkflowRun::find_by_id(&pool, workflow_run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .transitions_used,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_continuation_rejects_the_stale_claim_owner() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let source_status_id = Uuid::new_v4();
+        let target_status_id = Uuid::new_v4();
+        let configured = automation(project_id, source_status_id, Some(target_status_id), 2);
+        let stage_run = ProjectStatusEntry::observe(
+            &pool,
+            project_id,
+            &observation(issue_id, source_status_id, Utc::now()),
+            Some(&configured),
+        )
+        .await
+        .unwrap()
+        .stage_run
+        .unwrap();
+        let result = failed_attempt_result(&pool, stage_run.id).await;
+        let stage_run = ProjectStatusStageRun::find_by_id(&pool, stage_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let continuation = ProjectStatusStageContinuation::create(
+            &pool,
+            &NewStageContinuation {
+                result_id: result.id,
+                workflow_run_id: stage_run.workflow_run_id.unwrap(),
+                source_stage_run_id: stage_run.id,
+                source_status_id,
+                target_status_id: Some(target_status_id),
+                status: StageContinuationStatus::Pending,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let first_token = match ProjectStatusStageContinuation::claim(&pool, continuation.id)
+            .await
+            .unwrap()
+        {
+            ContinuationClaimOutcome::Claimed { token } => token,
+            outcome => panic!("expected first claim, got {outcome:?}"),
+        };
+        let checkpoint = Utc::now();
+        assert!(
+            ProjectStatusStageContinuation::record_remote_transition(
+                &pool,
+                continuation.id,
+                first_token,
+                checkpoint,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            ProjectStatusStageContinuation::requeue_interrupted_claims(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let second_token = match ProjectStatusStageContinuation::claim(&pool, continuation.id)
+            .await
+            .unwrap()
+        {
+            ContinuationClaimOutcome::Claimed { token } => token,
+            outcome => panic!("expected replacement claim, got {outcome:?}"),
+        };
+        assert_ne!(first_token, second_token);
+        assert_eq!(
+            ProjectStatusStageContinuation::find_by_id(&pool, continuation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .remote_issue_updated_at,
+            Some(checkpoint)
+        );
+        assert_eq!(
+            ProjectStatusWorkflowRun::find_by_id(&pool, stage_run.workflow_run_id.unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .transitions_used,
+            1
+        );
+
+        assert!(
+            !ProjectStatusStageContinuation::mark_advanced(
+                &pool,
+                continuation.id,
+                first_token,
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            ProjectStatusStageContinuation::find_by_id(&pool, continuation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageContinuationStatus::Applying
+        );
+        assert!(
+            ProjectStatusStageContinuation::mark_advanced(
+                &pool,
+                continuation.id,
+                second_token,
+                Utc::now(),
+            )
+            .await
+            .unwrap()
         );
     }
 }

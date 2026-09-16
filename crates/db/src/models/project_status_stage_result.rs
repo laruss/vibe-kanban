@@ -188,6 +188,29 @@ impl ProjectStatusStageAttempt {
         row.map(Self::try_from).transpose()
     }
 
+    pub async fn is_latest_for_stage_run(
+        pool: &SqlitePool,
+        stage_run_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM project_status_stage_attempts attempt
+                   WHERE attempt.id = ? AND attempt.stage_run_id = ?
+                     AND attempt.id = (
+                         SELECT latest.id FROM project_status_stage_attempts latest
+                         WHERE latest.stage_run_id = ?
+                         ORDER BY latest.attempt_number DESC LIMIT 1
+                     )
+               )"#,
+        )
+        .bind(attempt_id)
+        .bind(stage_run_id)
+        .bind(stage_run_id)
+        .fetch_one(pool)
+        .await
+    }
+
     pub async fn list_by_stage_run(
         pool: &SqlitePool,
         stage_run_id: Uuid,
@@ -197,6 +220,22 @@ impl ProjectStatusStageAttempt {
             Self::select_sql("stage_run_id = ?")
         ))
         .bind(stage_run_id)
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter().map(Self::try_from).collect()
+    }
+
+    pub async fn list_unmaterialized_terminal(pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ProjectStatusStageAttemptRow>(&format!(
+            "{} ORDER BY completed_at, created_at LIMIT 64",
+            Self::select_sql(
+                "status IN ('completed', 'failed', 'killed', 'start_failed') \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM project_status_stage_results result \
+                     WHERE result.attempt_id = project_status_stage_attempts.id\
+                 )",
+            )
+        ))
         .fetch_all(pool)
         .await?;
         rows.into_iter().map(Self::try_from).collect()
@@ -241,15 +280,18 @@ impl ProjectStatusStageAttempt {
         id: Uuid,
         workspace_id: Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        let updated = sqlx::query(
             r#"UPDATE project_status_stage_attempts
                SET workspace_id = ?, updated_at = datetime('now', 'subsec')
-               WHERE id = ?"#,
+               WHERE id = ? AND status IN ('starting', 'running')"#,
         )
         .bind(workspace_id)
         .bind(id)
         .execute(pool)
         .await?;
+        if updated.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
@@ -313,6 +355,47 @@ impl ProjectStatusStageAttempt {
                         repository.resulting_head_commit = state.after_head_commit;
                     }
                 }
+            }
+        }
+        let mut repositories = repositories.into_values().collect::<Vec<_>>();
+        repositories.sort_by(|left, right| left.repo_name.cmp(&right.repo_name));
+        Ok(repositories)
+    }
+
+    pub async fn persisted_repository_inputs(
+        pool: &SqlitePool,
+        attempt_id: Uuid,
+    ) -> Result<Vec<StageResultRepositoryInput>, sqlx::Error> {
+        let mut repositories = HashMap::<Uuid, StageResultRepositoryInput>::new();
+        for execution_id in Self::execution_process_ids(pool, attempt_id).await? {
+            for state in
+                ExecutionProcessRepoState::find_by_execution_process_id(pool, execution_id).await?
+            {
+                if let Some(repository) = repositories.get_mut(&state.repo_id) {
+                    if repository.base_head_commit.is_none() {
+                        repository.base_head_commit = state.before_head_commit;
+                    }
+                    if state.after_head_commit.is_some() {
+                        repository.resulting_head_commit = state.after_head_commit;
+                    }
+                    continue;
+                }
+
+                let repo_name = Repo::find_by_id(pool, state.repo_id)
+                    .await?
+                    .map(|repo| repo.display_name)
+                    .unwrap_or_else(|| state.repo_id.to_string());
+                repositories.insert(
+                    state.repo_id,
+                    StageResultRepositoryInput {
+                        repo_id: state.repo_id,
+                        repo_name,
+                        base_head_commit: state.before_head_commit,
+                        resulting_head_commit: state.after_head_commit,
+                        uncommitted_changes_count: None,
+                        untracked_files_count: None,
+                    },
+                );
             }
         }
         let mut repositories = repositories.into_values().collect::<Vec<_>>();

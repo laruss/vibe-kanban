@@ -17,7 +17,9 @@ use db::{
         execution_process_repo_state::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
+        project_status_stage_result::{ProjectStatusStageAttempt, ProjectStatusStageResult},
         project_status_stage_run::ProjectStatusStageRun,
+        project_status_workflow::ProjectStatusStageContinuation,
         repo::Repo,
         session::{CreateSession, Session, SessionError},
         workspace::{Workspace, WorkspaceError},
@@ -237,18 +239,48 @@ pub trait ContainerService {
 
     /// Finalize workspace execution by sending notifications
     async fn finalize_task(&self, ctx: &ExecutionContext) {
-        if let Err(error) = ProjectStatusStageRun::finish_for_execution(
+        let stage_context = if let Ok(Some(attempt_id)) =
+            ProjectStatusStageAttempt::id_for_execution(&self.db().pool, ctx.execution_process.id)
+                .await
+            && let Ok(Some(attempt)) =
+                ProjectStatusStageAttempt::find_by_id(&self.db().pool, attempt_id).await
+            && let Ok(Some(stage_run)) =
+                ProjectStatusStageRun::find_by_id(&self.db().pool, attempt.stage_run_id).await
+        {
+            Some((attempt, stage_run))
+        } else {
+            None
+        };
+        match ProjectStatusStageRun::finish_for_execution(
             &self.db().pool,
             ctx.execution_process.id,
             &ctx.execution_process.status,
         )
         .await
         {
-            tracing::error!(
+            Ok(true) => {
+                if let Some((attempt, stage_run)) = stage_context {
+                    tracing::info!(
+                        remote_project_id = %stage_run.remote_project_id,
+                        issue_id = %stage_run.issue_id,
+                        project_status_id = %stage_run.project_status_id,
+                        status_entry_id = %stage_run.status_entry_id,
+                        stage_run_id = %stage_run.id,
+                        stage_attempt_id = %attempt.id,
+                        workspace_id = %ctx.workspace.id,
+                        session_id = %ctx.session.id,
+                        execution_process_id = %ctx.execution_process.id,
+                        execution_status = ?ctx.execution_process.status,
+                        "Finalized project status stage execution"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tracing::error!(
                 execution_process_id = %ctx.execution_process.id,
                 %error,
                 "Failed to finalize project status stage run"
-            );
+            ),
         }
 
         // Skip notification if process was intentionally killed by user
@@ -288,11 +320,38 @@ pub trait ContainerService {
     async fn cleanup_orphan_executions(&self) -> Result<(), ContainerError> {
         let running_processes = ExecutionProcess::find_running(&self.db().pool).await?;
         for process in running_processes {
-            tracing::info!(
-                "Found orphaned execution process {} for session {}",
-                process.id,
-                process.session_id
-            );
+            let stage_context = if let Some(attempt_id) =
+                ProjectStatusStageAttempt::id_for_execution(&self.db().pool, process.id).await?
+                && let Some(attempt) =
+                    ProjectStatusStageAttempt::find_by_id(&self.db().pool, attempt_id).await?
+                && let Some(stage_run) =
+                    ProjectStatusStageRun::find_by_id(&self.db().pool, attempt.stage_run_id).await?
+            {
+                Some((attempt, stage_run))
+            } else {
+                None
+            };
+            if let Some((attempt, stage_run)) = &stage_context {
+                tracing::warn!(
+                    remote_project_id = %stage_run.remote_project_id,
+                    issue_id = %stage_run.issue_id,
+                    project_status_id = %stage_run.project_status_id,
+                    status_entry_id = %stage_run.status_entry_id,
+                    stage_run_id = %stage_run.id,
+                    stage_attempt_id = %attempt.id,
+                    workspace_id = ?attempt.workspace_id,
+                    session_id = %process.session_id,
+                    execution_process_id = %process.id,
+                    reason = "service_restarted",
+                    "Found interrupted project status stage execution"
+                );
+            } else {
+                tracing::info!(
+                    execution_process_id = %process.id,
+                    session_id = %process.session_id,
+                    "Found orphaned execution process"
+                );
+            }
             // Update the execution process status first
             if let Err(e) = ExecutionProcess::update_completion(
                 &self.db().pool,
@@ -308,6 +367,17 @@ pub trait ContainerService {
                     e
                 );
                 continue;
+            }
+            if let Err(error) =
+                ProjectStatusStageRun::finish_interrupted_execution(&self.db().pool, process.id)
+                    .await
+            {
+                tracing::error!(
+                    execution_process_id = %process.id,
+                    session_id = %process.session_id,
+                    %error,
+                    "Failed to reconcile interrupted project status stage execution"
+                );
             }
             // Capture after-head commit OID per repository
             if let Ok(ctx) = ExecutionProcess::load_context(&self.db().pool, process.id).await
@@ -337,6 +407,78 @@ pub trait ContainerService {
             // Process marked as failed
             tracing::info!("Marked orphaned execution process {} as failed", process.id);
         }
+
+        let interrupted_attempt_ids =
+            ProjectStatusStageRun::fail_interrupted_attempts(&self.db().pool).await?;
+        for attempt_id in &interrupted_attempt_ids {
+            tracing::warn!(
+                stage_attempt_id = %attempt_id,
+                reason = "service_restarted",
+                "Reconciled interrupted project status stage attempt"
+            );
+        }
+
+        let requeued_continuations =
+            ProjectStatusStageContinuation::requeue_interrupted_claims(&self.db().pool).await?;
+
+        let terminal_attempts =
+            ProjectStatusStageAttempt::list_unmaterialized_terminal(&self.db().pool).await?;
+        let mut materialized_results = 0usize;
+        for attempt in terminal_attempts {
+            let repositories = match ProjectStatusStageAttempt::persisted_repository_inputs(
+                &self.db().pool,
+                attempt.id,
+            )
+            .await
+            {
+                Ok(repositories) => repositories,
+                Err(error) => {
+                    tracing::error!(
+                        stage_run_id = %attempt.stage_run_id,
+                        stage_attempt_id = %attempt.id,
+                        %error,
+                        "Failed to load persisted repository state during stage recovery"
+                    );
+                    continue;
+                }
+            };
+            match ProjectStatusStageResult::materialize_for_attempt(
+                &self.db().pool,
+                attempt.id,
+                &repositories,
+            )
+            .await
+            {
+                Ok(Some(result)) => {
+                    materialized_results += 1;
+                    tracing::info!(
+                        issue_id = %result.issue_id,
+                        project_status_id = %result.project_status_id,
+                        status_entry_id = %result.status_entry_id,
+                        stage_run_id = %result.stage_run_id,
+                        stage_attempt_id = %result.attempt_id,
+                        stage_result_id = %result.id,
+                        outcome = ?result.outcome,
+                        "Materialized project status stage result during startup recovery"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        stage_run_id = %attempt.stage_run_id,
+                        stage_attempt_id = %attempt.id,
+                        %error,
+                        "Failed to materialize project status stage result during startup recovery"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            interrupted_attempts = interrupted_attempt_ids.len(),
+            materialized_results,
+            requeued_continuations,
+            "Project status automation startup recovery completed"
+        );
         Ok(())
     }
 
@@ -1074,7 +1216,7 @@ pub trait ContainerService {
         workspace: &Workspace,
         executor_config: ExecutorConfig,
         prompt: String,
-        stage_run_id: Option<Uuid>,
+        stage_attempt_id: Option<Uuid>,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Create container
         self.create(workspace).await?;
@@ -1139,7 +1281,7 @@ pub trait ContainerService {
                 &session,
                 &coding_action,
                 &ExecutionProcessRunReason::CodingAgent,
-                stage_run_id,
+                stage_attempt_id,
             )
             .await?
         } else {
@@ -1150,7 +1292,7 @@ pub trait ContainerService {
                 &session,
                 &main_action,
                 &ExecutionProcessRunReason::SetupScript,
-                stage_run_id,
+                stage_attempt_id,
             )
             .await?
         };
@@ -1175,7 +1317,7 @@ pub trait ContainerService {
         session: &Session,
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
-        stage_run_id: Option<Uuid>,
+        stage_attempt_id: Option<Uuid>,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
@@ -1218,25 +1360,39 @@ pub trait ContainerService {
         )
         .await?;
 
-        if let Some(stage_run_id) = stage_run_id
-            && let Err(error) = ProjectStatusStageRun::attach_execution(
+        if let Some(stage_attempt_id) = stage_attempt_id {
+            let attempt = ProjectStatusStageAttempt::find_by_id(&self.db().pool, stage_attempt_id)
+                .await?
+                .ok_or(SqlxError::RowNotFound)?;
+            if let Err(error) = ProjectStatusStageRun::attach_execution(
                 &self.db().pool,
-                stage_run_id,
+                attempt.stage_run_id,
+                attempt.id,
                 execution_process.id,
                 session.id,
                 workspace.id,
                 run_reason,
             )
             .await
-        {
-            let _ = ExecutionProcess::update_completion(
-                &self.db().pool,
-                execution_process.id,
-                ExecutionProcessStatus::Failed,
-                None,
-            )
-            .await;
-            return Err(error.into());
+            {
+                let _ = ExecutionProcess::update_completion(
+                    &self.db().pool,
+                    execution_process.id,
+                    ExecutionProcessStatus::Failed,
+                    None,
+                )
+                .await;
+                return Err(error.into());
+            }
+            tracing::info!(
+                stage_run_id = %attempt.stage_run_id,
+                stage_attempt_id = %attempt.id,
+                workspace_id = %workspace.id,
+                session_id = %session.id,
+                execution_process_id = %execution_process.id,
+                run_reason = ?run_reason,
+                "Attached execution to project status stage attempt"
+            );
         }
         self.msg_stores()
             .write()
@@ -1444,18 +1600,16 @@ pub trait ContainerService {
             ) => ExecutionProcessRunReason::CodingAgent,
         };
 
-        let stage_run_id = ProjectStatusStageRun::stage_run_id_for_execution(
-            &self.db().pool,
-            ctx.execution_process.id,
-        )
-        .await?;
+        let stage_attempt_id =
+            ProjectStatusStageAttempt::id_for_execution(&self.db().pool, ctx.execution_process.id)
+                .await?;
 
         self.start_execution_for_stage(
             &ctx.workspace,
             &ctx.session,
             next_action,
             &next_run_reason,
-            stage_run_id,
+            stage_attempt_id,
         )
         .await?;
 

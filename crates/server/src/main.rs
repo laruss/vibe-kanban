@@ -142,7 +142,7 @@ async fn main() -> Result<(), VibeKanbanError> {
     let app_router = routes::router(deployment.clone());
 
     // Production only: open browser
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && open_browser_on_startup() {
         tracing::info!("Opening browser...");
         let browser_port = actual_main_port;
         tokio::spawn(async move {
@@ -195,6 +195,15 @@ async fn main() -> Result<(), VibeKanbanError> {
     perform_cleanup_actions(&deployment).await;
 
     Ok(())
+}
+
+fn open_browser_on_startup() -> bool {
+    !std::env::var("VIBE_KANBAN_OPEN_BROWSER").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 pub async fn shutdown_signal() {

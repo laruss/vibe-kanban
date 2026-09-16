@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    fs::OpenOptions,
+    path::Path,
     sync::{Arc, OnceLock},
 };
 
@@ -79,6 +81,7 @@ pub struct LocalDeployment {
     ssh_config: Arc<russh::server::Config>,
     pty: PtyService,
     pr_sync_notify: Arc<Notify>,
+    _instance_lock: Arc<std::fs::File>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,9 +90,34 @@ struct PendingHandoff {
     app_verifier: String,
 }
 
+fn lock_data_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    let instance_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.join("instance.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&instance_lock)?;
+    Ok(instance_lock)
+}
+
 #[async_trait]
 impl Deployment for LocalDeployment {
     async fn new(shutdown: CancellationToken) -> Result<Self, DeploymentError> {
+        let data_directory = utils::assets::asset_dir();
+        let instance_lock = lock_data_directory(&data_directory).map_err(|error| {
+            let reason = if error.kind() == std::io::ErrorKind::WouldBlock {
+                "another Vibe Kanban process is already using it".to_string()
+            } else {
+                error.to_string()
+            };
+            DeploymentError::Other(anyhow::anyhow!(
+                "Failed to lock Vibe Kanban data directory '{}': {reason}",
+                data_directory.display(),
+            ))
+        })?;
+        let instance_lock = Arc::new(instance_lock);
+
         // Run one-time process logs migration from DB to filesystem
         services::services::execution_process::migrate_execution_logs_to_files()
             .await
@@ -293,6 +321,7 @@ impl Deployment for LocalDeployment {
             ssh_config,
             pty,
             pr_sync_notify,
+            _instance_lock: instance_lock,
         };
 
         Ok(deployment)
@@ -484,5 +513,19 @@ impl LocalDeployment {
 
     pub fn trigger_pr_sync(&self) {
         self.pr_sync_notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_data_directory;
+
+    #[test]
+    fn data_directory_has_a_single_process_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = lock_data_directory(directory.path()).unwrap();
+        assert!(lock_data_directory(directory.path()).is_err());
+        drop(first);
+        assert!(lock_data_directory(directory.path()).is_ok());
     }
 }

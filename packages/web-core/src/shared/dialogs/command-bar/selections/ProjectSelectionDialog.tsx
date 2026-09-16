@@ -21,6 +21,8 @@ import type { StatusSelectionResult } from './statusSelection';
 import type { PrioritySelectionResult } from './prioritySelection';
 import type { SubIssueSelectionResult } from './subIssueSelection';
 import type { RelationshipSelectionResult } from './relationshipSelection';
+import { guardRunningStageMove } from '@/features/project-automation/model/statusMoveGuard';
+import { useProjectStatusAutomations } from '@/features/project-automation/model/queries';
 
 // Union of all selection modes
 export type SelectionMode =
@@ -57,8 +59,15 @@ function getInitialPageId(selectionType: SelectionMode['type']): string {
 }
 
 // Inner component that has access to ProjectContext
-function ProjectSelectionContent({ selection }: { selection: SelectionMode }) {
+function ProjectSelectionContent({
+  projectId,
+  selection,
+}: {
+  projectId: string;
+  selection: SelectionMode;
+}) {
   const modal = useModal();
+  const automationsQuery = useProjectStatusAutomations(projectId);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const {
     statuses,
@@ -198,18 +207,36 @@ function ProjectSelectionContent({ selection }: { selection: SelectionMode }) {
 
   // Handle mutation after selection
   const handleResult = useCallback(
-    (data: unknown) => {
-      if (!data) return;
+    async (data: unknown): Promise<boolean> => {
+      if (!data) return false;
 
       if (selection.type === 'status') {
         const result = data as StatusSelectionResult;
-        if (selection.isCreateMode) return; // Create mode: caller handles URL update
+        if (selection.isCreateMode) return true; // Create mode: caller handles URL update
+        const automations =
+          automationsQuery.data?.automations ??
+          (await automationsQuery.refetch()).data?.automations ??
+          [];
+        if (automations.length > 0) {
+          try {
+            const shouldMove = await guardRunningStageMove(
+              projectId,
+              selection.issueIds
+            );
+            if (!shouldMove) return false;
+          } catch (error) {
+            console.warn(
+              'Could not inspect running stages before changing status:',
+              error
+            );
+          }
+        }
         for (const issueId of selection.issueIds) {
           updateIssue(issueId, { status_id: result.statusId });
         }
       } else if (selection.type === 'priority') {
         const result = data as PrioritySelectionResult;
-        if (selection.isCreateMode) return;
+        if (selection.isCreateMode) return true;
         for (const issueId of selection.issueIds) {
           updateIssue(issueId, { priority: result.priority });
         }
@@ -243,8 +270,15 @@ function ProjectSelectionContent({ selection }: { selection: SelectionMode }) {
           });
         }
       }
+      return true;
     },
-    [selection, updateIssue, insertIssueRelationship]
+    [
+      selection,
+      projectId,
+      automationsQuery,
+      updateIssue,
+      insertIssueRelationship,
+    ]
   );
 
   const fallbackPage = pages[initialPageId] ?? Object.values(pages)[0];
@@ -264,16 +298,19 @@ function ProjectSelectionContent({ selection }: { selection: SelectionMode }) {
 
   const handleSelect = useCallback(
     (item: CommandBarGroupItem<ActionDefinition, PageId>) => {
-      const result = currentPage.onSelect(item as ResolvedGroupItem);
-      if (result.type === 'complete') {
-        handleResult(result.data);
-        modal.resolve(result.data);
-        modal.hide();
-      } else if (result.type === 'navigate') {
-        setPageStack((prev) => [...prev, currentPage.id]);
-        setCurrentPageId(result.pageId);
-        setSearch('');
-      }
+      void (async () => {
+        const result = currentPage.onSelect(item as ResolvedGroupItem);
+        if (result.type === 'complete') {
+          const completed = await handleResult(result.data);
+          if (!completed) return;
+          modal.resolve(result.data);
+          modal.hide();
+        } else if (result.type === 'navigate') {
+          setPageStack((prev) => [...prev, currentPage.id]);
+          setCurrentPageId(result.pageId);
+          setSearch('');
+        }
+      })();
     },
     [currentPage, modal, handleResult]
   );
@@ -329,7 +366,7 @@ const ProjectSelectionDialogImpl = create<ProjectSelectionDialogProps>(
   ({ projectId, selection }) => {
     return (
       <ProjectProvider projectId={projectId}>
-        <ProjectSelectionContent selection={selection} />
+        <ProjectSelectionContent projectId={projectId} selection={selection} />
       </ProjectProvider>
     );
   }

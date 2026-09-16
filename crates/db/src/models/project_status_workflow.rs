@@ -201,6 +201,23 @@ impl ProjectStatusWorkflowRun {
         row.map(Self::try_from).transpose()
     }
 
+    pub async fn list_open_by_project(
+        pool: &SqlitePool,
+        remote_project_id: Uuid,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, WorkflowRunRow>(&format!(
+            "{} ORDER BY updated_at DESC",
+            Self::select_sql(
+                "remote_project_id = ? \
+                 AND status IN ('active', 'paused', 'awaiting_manual')",
+            )
+        ))
+        .bind(remote_project_id)
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter().map(Self::try_from).collect()
+    }
+
     pub(crate) async fn ensure_for_stage_run_in_transaction(
         transaction: &mut Transaction<'_, Sqlite>,
         stage_run_id: Uuid,
@@ -964,6 +981,68 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_overview_lists_only_open_workflows_from_the_project() {
+        let pool = migrated_pool().await;
+        let project_id = Uuid::new_v4();
+        let other_project_id = Uuid::new_v4();
+        let open_issue_id = Uuid::new_v4();
+        let completed_issue_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+        let mut workflow_ids = Vec::new();
+
+        for (project, issue) in [
+            (project_id, open_issue_id),
+            (project_id, completed_issue_id),
+            (other_project_id, Uuid::new_v4()),
+        ] {
+            let configured = automation(project, status_id, None, 10);
+            let run = ProjectStatusEntry::observe(
+                &pool,
+                project,
+                &observation(issue, status_id, Utc::now()),
+                Some(&configured),
+            )
+            .await
+            .unwrap()
+            .stage_run
+            .unwrap();
+            workflow_ids.push(
+                ProjectStatusStageRun::claim_start(&pool, run.id)
+                    .await
+                    .unwrap()
+                    .workflow_run_id
+                    .unwrap(),
+            );
+        }
+
+        ProjectStatusWorkflowRun::set_status(
+            &pool,
+            workflow_ids[0],
+            WorkflowRunStatus::Paused,
+            Some("paused_by_user"),
+            Some("paused"),
+        )
+        .await
+        .unwrap();
+        ProjectStatusWorkflowRun::set_status(
+            &pool,
+            workflow_ids[1],
+            WorkflowRunStatus::Completed,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let workflows = ProjectStatusWorkflowRun::list_open_by_project(&pool, project_id)
+            .await
+            .unwrap();
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].issue_id, open_issue_id);
+        assert_eq!(workflows[0].status, WorkflowRunStatus::Paused);
     }
 
     #[tokio::test]

@@ -73,6 +73,15 @@ import type { IssuePriority } from 'shared/remote-types';
 import { useIssueMultiSelect } from '@/shared/hooks/useIssueMultiSelect';
 import { useIssueSelectionStore } from '@/shared/stores/useIssueSelectionStore';
 import { BulkActionBarContainer } from './BulkActionBarContainer';
+import {
+  useProjectAutomationOverview,
+  useProjectStatusAutomations,
+} from '@/features/project-automation/model/queries';
+import {
+  deriveAutomationCardState,
+  formatExecutorProfile,
+} from '@/features/project-automation/model/automationState';
+import { guardRunningStageMove } from '@/features/project-automation/model/statusMoveGuard';
 
 const areStringSetsEqual = (left: string[], right: string[]): boolean => {
   if (left.length !== right.length) {
@@ -149,6 +158,20 @@ export function KanbanContainer() {
     pullRequests,
     isLoading: projectLoading,
   } = useProjectContext();
+  const statusAutomationsQuery = useProjectStatusAutomations(projectId);
+  const enabledAutomationsByStatus = useMemo(
+    () =>
+      new Map(
+        (statusAutomationsQuery.data?.automations ?? [])
+          .filter((response) => response.automation.enabled)
+          .map((response) => [response.automation.project_status_id, response])
+      ),
+    [statusAutomationsQuery.data]
+  );
+  const automationOverviewQuery = useProjectAutomationOverview(
+    projectId,
+    enabledAutomationsByStatus.size > 0
+  );
 
   const {
     projects,
@@ -656,7 +679,7 @@ export function KanbanContainer() {
 
   // Simple onDragEnd handler - the library handles all visual movement
   const handleDragEnd = useCallback(
-    (result: DropResult) => {
+    async (result: DropResult) => {
       const { source, destination } = result;
 
       // Dropped outside a valid droppable
@@ -681,6 +704,30 @@ export function KanbanContainer() {
       const sourceId = source.droppableId;
       const destId = destination.droppableId;
       const isCrossColumn = sourceId !== destId;
+
+      let projectHasAutomation =
+        (statusAutomationsQuery.data?.automations.length ?? 0) > 0;
+      if (isCrossColumn && statusAutomationsQuery.data === undefined) {
+        projectHasAutomation =
+          ((await statusAutomationsQuery.refetch()).data?.automations.length ??
+            0) > 0;
+      }
+      if (isCrossColumn && projectHasAutomation) {
+        const movedIssueId = items[sourceId]?.[source.index];
+        if (movedIssueId) {
+          try {
+            const shouldMove = await guardRunningStageMove(projectId, [
+              movedIssueId,
+            ]);
+            if (!shouldMove) return;
+          } catch (error) {
+            console.warn(
+              'Could not inspect the running stage before moving the issue:',
+              error
+            );
+          }
+        }
+      }
 
       // Update local state and capture new items for bulk update
       let newItems: Record<string, string[]> = {};
@@ -746,7 +793,13 @@ export function KanbanContainer() {
           }, 500);
         });
     },
-    [kanbanFilters.sortField, calculateSortOrder]
+    [
+      kanbanFilters.sortField,
+      calculateSortOrder,
+      items,
+      projectId,
+      statusAutomationsQuery,
+    ]
   );
 
   // Multi-select support
@@ -1026,6 +1079,12 @@ export function KanbanContainer() {
                           // do not render it again at the issue level.
                           return !workspaceIdsShownOnCard.has(pr.workspace_id);
                         });
+                        const automationCardState = deriveAutomationCardState(
+                          issue.id,
+                          issue.status_id,
+                          enabledAutomationsByStatus.get(issue.status_id),
+                          automationOverviewQuery.data
+                        );
 
                         return (
                           <KanbanCard
@@ -1054,6 +1113,16 @@ export function KanbanContainer() {
                                 issuesById
                               )}
                               isSubIssue={!!issue.parent_issue_id}
+                              automation={
+                                automationCardState
+                                  ? {
+                                      agentLabel: formatExecutorProfile(
+                                        automationCardState.profile
+                                      ),
+                                      status: automationCardState.status,
+                                    }
+                                  : null
+                              }
                               isMobile={isMobile}
                               onPriorityClick={(e) => {
                                 e.stopPropagation();

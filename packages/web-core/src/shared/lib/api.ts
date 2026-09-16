@@ -108,6 +108,7 @@ import {
   ObserveIssueStatusesRequest,
   ObserveIssueStatusesResponse,
   ProjectStatusStageRunResponse,
+  ProjectAutomationOverview,
   ResumeProjectStatusAutomationRequest,
   StartProjectStatusStageRequest,
 } from 'shared/types';
@@ -1549,6 +1550,15 @@ export const projectStatusAutomationsApi = {
 };
 
 export const projectStatusStageRunsApi = {
+  getProjectOverview: async (
+    remoteProjectId: string
+  ): Promise<ProjectAutomationOverview> => {
+    const response = await makeRequest(
+      `/api/projects/${remoteProjectId}/automation/overview`
+    );
+    return handleApiResponse<ProjectAutomationOverview>(response);
+  },
+
   observeStatuses: async (
     remoteProjectId: string,
     request: ObserveIssueStatusesRequest

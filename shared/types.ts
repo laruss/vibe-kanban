@@ -42,9 +42,13 @@ export type ProjectStatusEntry = { id: string, remote_project_id: string, issue_
 
 export type ProjectStatusStageRun = { id: string, status_entry_id: string, remote_project_id: string, issue_id: string, project_status_id: string, automation_revision: bigint, workflow_run_id: string | null, trigger: StageRunTrigger, status: StageRunStatus, executor_profile_id: ExecutorProfileId, instructions: string, session_mode: AutomationSessionMode, completion_mode: AutomationCompletionMode, next_status_id: string | null, transition_budget: number, workspace_id: string | null, session_id: string | null, error_code: string | null, error_message: string | null, started_at: string | null, completed_at: string | null, created_at: string, updated_at: string, };
 
+export type ProjectStatusStageRunSummary = { id: string, issue_id: string, project_status_id: string, status: StageRunStatus, executor_profile_id: ExecutorProfileId, };
+
 export type ProjectStatusStageRunResponse = { stage_run: ProjectStatusStageRun, execution_process_ids: Array<string>, attempts: Array<ProjectStatusStageAttemptResponse>, };
 
 export type IssueAutomationState = { current_status_id: string | null, active_entry: ProjectStatusEntry | null, stage_runs: Array<ProjectStatusStageRunResponse>, workflow_runs: Array<ProjectStatusWorkflowRun>, continuations: Array<ProjectStatusStageContinuation>, };
+
+export type ProjectAutomationOverview = { stage_runs: Array<ProjectStatusStageRunSummary>, workflow_runs: Array<ProjectStatusWorkflowRun>, };
 
 export type ProjectStatusStageAttempt = { id: string, stage_run_id: string, attempt_number: bigint, input_result_id: string | null, status: StageRunStatus, executor_profile_id: ExecutorProfileId, automation_revision: bigint, workspace_id: string | null, session_id: string | null, rendered_prompt: string | null, prompt_schema_version: bigint, error_code: string | null, error_message: string | null, started_at: string, completed_at: string | null, created_at: string, updated_at: string, };
 

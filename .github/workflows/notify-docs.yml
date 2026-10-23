@@ -1,0 +1,25 @@
+name: Notify docs repository
+
+# Запускает синхронизацию laruss/private-docs на каждый пуш документации.
+# Ставится скриптом scripts/connect-repo.sh из laruss/private-docs: он подставляет client-id, ветку
+# и путь и записывает секрет DOCS_NOTIFY_KEY, приватный ключ GitHub App laruss-docs-notify.
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**"]
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: Iv23lilqrrMjAwlZcTLi
+          private-key: ${{ secrets.DOCS_NOTIFY_KEY }}
+          owner: laruss
+          repositories: private-docs
+      - env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: gh workflow run sync-docs.yml -R laruss/private-docs

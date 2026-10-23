@@ -22,4 +22,5 @@ jobs:
           repositories: private-docs
       - env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: gh workflow run sync-docs.yml -R laruss/private-docs
+        # REST, а не `gh workflow run`: тот читает ветку по умолчанию через GraphQL, а у App нет доступа к коду
+        run: gh api -X POST repos/laruss/private-docs/actions/workflows/sync-docs.yml/dispatches -f ref=main
